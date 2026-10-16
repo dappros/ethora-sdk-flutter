@@ -1,5 +1,66 @@
 import 'chat_room.dart';
 import 'chat_user.dart';
+import 'chat_message.dart';
+
+typedef OnMessageSent = Future<void> Function(ChatMessageSentEvent event);
+
+class ChatMessageSentEvent {
+  const ChatMessageSentEvent({
+    required this.message,
+    required this.roomJid,
+    required this.messageId,
+    required this.sentAt,
+  });
+
+  final ChatMessage message;
+  final String roomJid;
+  final String messageId;
+  final DateTime sentAt;
+}
+
+class ChatEventHandlers {
+  const ChatEventHandlers({this.onMessageSent});
+
+  final OnMessageSent? onMessageSent;
+}
+
+class NotificationOffset {
+  const NotificationOffset({
+    this.left = 20,
+    this.right = 20,
+    this.top = 20,
+    this.bottom = 20,
+  });
+
+  final double left;
+  final double right;
+  final double top;
+  final double bottom;
+}
+
+class NotificationPosition {
+  const NotificationPosition({
+    this.horizontal = 'left',
+    this.vertical = 'bottom',
+    this.offset = const NotificationOffset(),
+  });
+
+  final String horizontal;
+  final String vertical;
+  final NotificationOffset offset;
+}
+
+class InAppNotificationsConfig {
+  const InAppNotificationsConfig({
+    this.enabled = false,
+    this.showInContext = true,
+    this.position = const NotificationPosition(),
+  });
+
+  final bool enabled;
+  final bool showInContext;
+  final NotificationPosition position;
+}
 
 class ChatComponentConfig {
   const ChatComponentConfig({
@@ -31,6 +92,9 @@ class ChatComponentConfig {
     this.disableSentLogic,
     this.initBeforeLoad,
     this.newArch = true,
+    this.roomJID,
+    this.eventHandlers,
+    this.inAppNotifications,
     this.qrUrl,
     this.botMessageAutoScroll = true,
     this.disableTypingIndicator = false,
@@ -66,6 +130,9 @@ class ChatComponentConfig {
   final bool? disableSentLogic;
   final bool? initBeforeLoad;
   final bool? newArch;
+  final String? roomJID;
+  final ChatEventHandlers? eventHandlers;
+  final InAppNotificationsConfig? inAppNotifications;
   final String? qrUrl;
   final bool botMessageAutoScroll;
   final bool disableTypingIndicator;
@@ -141,16 +208,30 @@ class CustomLoginConfig {
 
 class XmppSettings {
   const XmppSettings({
-    required this.xmppServerUrl,
+    this.xmppServerUrl,
+    this.devServer,
     required this.host,
     required this.conference,
     this.xmppPingOnSendEnabled = true,
   });
 
-  final String xmppServerUrl;
+  final String? xmppServerUrl;
+  final String? devServer;
   final String host;
   final String conference;
   final bool xmppPingOnSendEnabled;
+
+  String get endpoint {
+    final preferred = (devServer ?? '').trim();
+    if (preferred.isNotEmpty) {
+      return preferred;
+    }
+    final fallback = (xmppServerUrl ?? '').trim();
+    if (fallback.isNotEmpty) {
+      return fallback;
+    }
+    return 'wss://$host/ws';
+  }
 }
 
 typedef RefreshFunction = Future<RefreshResult?> Function();

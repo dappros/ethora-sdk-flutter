@@ -186,6 +186,9 @@ class ApiClient {
   }
 
   Future<bool> _refreshTokensSingleFlight() async {
+    if (_config.refreshTokens?.enabled == false) {
+      return false;
+    }
     if (_refreshCompleter != null) {
       return _refreshCompleter!.future;
     }

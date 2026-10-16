@@ -13,8 +13,8 @@ import '../core/chat_component_log.dart';
 import '../core/chat_component_state.dart';
 
 typedef XmppMessageCallback = void Function(ChatMessage message);
-typedef XmppTypingCallback = void Function(
-    String roomJid, List<String> composingUsers);
+typedef XmppTypingCallback =
+    void Function(String roomJid, List<String> composingUsers);
 typedef XmppConnectionCallback = void Function(ChatConnectionState state);
 
 class XmppClient {
@@ -29,10 +29,12 @@ class XmppClient {
   Timer? _reconnectTimer;
   bool _manuallyClosed = false;
   int _reconnectAttempts = 0;
+  final Map<String, int> _privateStoreTimestamps = <String, int>{};
 
   XmppMessageCallback? onMessage;
   XmppTypingCallback? onTyping;
   XmppConnectionCallback? onConnectionChanged;
+  void Function()? onReconnected;
 
   ChatConnectionState get state => _state;
   ChatConnectionState _state = ChatConnectionState.offline;
@@ -47,7 +49,7 @@ class XmppClient {
     _setState(ChatConnectionState.connecting);
     try {
       _channel = IOWebSocketChannel.connect(
-        Uri.parse(settings.xmppServerUrl),
+        Uri.parse(settings.endpoint),
         pingInterval: const Duration(seconds: 25),
       );
       _subscription = _channel!.stream.listen(
@@ -58,7 +60,11 @@ class XmppClient {
       _sendOpenStream();
       _sendAuth();
       _sendGlobalPresence();
+      final wasReconnect = _reconnectAttempts > 0;
       _setState(ChatConnectionState.online);
+      if (wasReconnect) {
+        onReconnected?.call();
+      }
     } catch (e) {
       log(
         ChatLogEvent(
@@ -132,8 +138,9 @@ class XmppClient {
     String? beforeId,
   }) async {
     final id = _nextId('history');
-    final beforeTag =
-        beforeId == null ? '<before/>' : '<before>$beforeId</before>';
+    final beforeTag = beforeId == null
+        ? '<before/>'
+        : '<before>$beforeId</before>';
     _sendRaw(
       "<iq to='$roomJid' type='set' id='$id'><query xmlns='urn:xmpp:mam:2' queryid='$id'><set xmlns='http://jabber.org/protocol/rsm'><max>$max</max>$beforeTag</set></query></iq>",
     );
@@ -171,6 +178,28 @@ class XmppClient {
     );
   }
 
+  Future<Map<String, int>> getChatsPrivateStore() async {
+    return Map<String, int>.from(_privateStoreTimestamps);
+  }
+
+  Future<void> setTimestampToPrivateStore({
+    required String chatId,
+    required int timestamp,
+    List<String>? chats,
+  }) async {
+    if (chatId.isEmpty || timestamp <= 0) return;
+    _privateStoreTimestamps[chatId] = timestamp;
+    for (final chat in chats ?? const <String>[]) {
+      if (chat.trim().isEmpty) continue;
+      _privateStoreTimestamps[chat.trim()] = timestamp;
+    }
+    final escapedChat = _xmlEscape(chatId);
+    final id = _nextId('private-store');
+    _sendRaw(
+      "<iq type='set' id='$id'><query xmlns='ethora:private-store'><chat id='$escapedChat' ts='$timestamp'/></query></iq>",
+    );
+  }
+
   void _handleRawStanza(dynamic raw) {
     final text = raw.toString();
     log(
@@ -203,7 +232,7 @@ class XmppClient {
   void _handleMessage(XmlElement node) {
     final resultNode =
         _findDirectChild(node, 'result', xmlns: 'urn:xmpp:mam:2') ??
-            _findDirectChild(node, 'result');
+        _findDirectChild(node, 'result');
     if (resultNode != null) {
       _handleMamResultMessage(node, resultNode);
       return;
@@ -246,12 +275,19 @@ class XmppClient {
   }
 
   void _handleMamResultMessage(
-      XmlElement stanzaMessage, XmlElement resultNode) {
-    final forwarded = _findDirectChild(resultNode, 'forwarded',
-            xmlns: 'urn:xmpp:forward:0') ??
+    XmlElement stanzaMessage,
+    XmlElement resultNode,
+  ) {
+    final forwarded =
+        _findDirectChild(
+          resultNode,
+          'forwarded',
+          xmlns: 'urn:xmpp:forward:0',
+        ) ??
         _findDirectChild(resultNode, 'forwarded');
-    final historyMessage =
-        forwarded == null ? null : _findDirectChild(forwarded, 'message');
+    final historyMessage = forwarded == null
+        ? null
+        : _findDirectChild(forwarded, 'message');
     if (historyMessage == null) {
       return;
     }
@@ -264,11 +300,13 @@ class XmppClient {
     }
     final from = historyMessage.getAttribute('from') ?? '';
     final senderName = from.contains('/') ? from.split('/').last : 'Unknown';
-    final messageId = historyMessage.getAttribute('id') ??
+    final messageId =
+        historyMessage.getAttribute('id') ??
         stanzaMessage.getAttribute('id') ??
         _nextId('history-msg');
-    final mediaFromData =
-        _tryParseMediaData(_findDirectChild(historyMessage, 'data'));
+    final mediaFromData = _tryParseMediaData(
+      _findDirectChild(historyMessage, 'data'),
+    );
     final parsed = mediaFromData ?? _tryParseMedia(body);
     if (body.trim().isEmpty && parsed == null) {
       return;

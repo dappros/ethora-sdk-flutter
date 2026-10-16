@@ -168,7 +168,8 @@ class _LoginCard extends StatelessWidget {
                   FilledButton(
                     onPressed: isLoggingIn ? null : onLoginEmail,
                     child: Text(
-                        isLoggingIn ? 'Signing in...' : 'Login with Email'),
+                      isLoggingIn ? 'Signing in...' : 'Login with Email',
+                    ),
                   ),
                 ] else ...[
                   TextField(
@@ -183,8 +184,9 @@ class _LoginCard extends StatelessWidget {
                   const SizedBox(height: 12),
                   FilledButton(
                     onPressed: isLoggingIn ? null : onLoginJwt,
-                    child:
-                        Text(isLoggingIn ? 'Signing in...' : 'Login with JWT'),
+                    child: Text(
+                      isLoggingIn ? 'Signing in...' : 'Login with JWT',
+                    ),
                   ),
                 ],
               ],
@@ -216,7 +218,8 @@ class _ChatLayout extends StatelessWidget {
         ? const <ChatMessage>[]
         : (state.messagesByRoom[selectedRoom.jid] ?? const <ChatMessage>[]);
     final wide = MediaQuery.sizeOf(context).width >= 920;
-    final roomListEnabled = true;
+    final roomListEnabled =
+        config.disableRooms != true && (config.roomJID ?? '').trim().isEmpty;
 
     if (wide && roomListEnabled) {
       return Row(
@@ -232,6 +235,7 @@ class _ChatLayout extends StatelessWidget {
           const VerticalDivider(width: 1),
           Expanded(
             child: _ConversationPane(
+              config: config,
               state: state,
               room: selectedRoom,
               messages: messages,
@@ -277,6 +281,7 @@ class _ChatLayout extends StatelessWidget {
           ),
         Expanded(
           child: _ConversationPane(
+            config: config,
             state: state,
             room: selectedRoom,
             messages: messages,
@@ -378,7 +383,11 @@ class _RoomsPane extends StatelessWidget {
                 trailing: room.pendingMessages > 0
                     ? _CountBadge(text: '${room.pendingMessages} sending')
                     : room.unreadCount > 0
-                        ? _CountBadge(text: '${room.unreadCount}')
+                        ? _CountBadge(
+                            text: room.unreadCapped
+                                ? '${room.unreadCount}+'
+                                : '${room.unreadCount}',
+                          )
                         : null,
                 onTap: () => onSelectRoom(room.jid),
               );
@@ -443,8 +452,10 @@ class _CompactRoomSelector extends StatelessWidget {
             .map(
               (room) => DropdownMenuItem<String>(
                 value: room.jid,
-                child: Text(room.title ?? room.jid,
-                    overflow: TextOverflow.ellipsis),
+                child: Text(
+                  room.title ?? room.jid,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
             )
             .toList(),
@@ -458,6 +469,7 @@ class _CompactRoomSelector extends StatelessWidget {
 
 class _ConversationPane extends StatelessWidget {
   const _ConversationPane({
+    required this.config,
     required this.state,
     required this.room,
     required this.messages,
@@ -468,6 +480,7 @@ class _ConversationPane extends StatelessWidget {
     required this.onLogout,
   });
 
+  final ChatComponentConfig config;
   final ChatComponentState state;
   final ChatRoom? room;
   final List<ChatMessage> messages;
@@ -495,15 +508,14 @@ class _ConversationPane extends StatelessWidget {
           padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
           decoration: BoxDecoration(
             color: Colors.white,
-            border: Border(
-              bottom: BorderSide(color: Colors.grey.shade200),
-            ),
+            border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
           ),
           child: Row(
             children: [
               IconButton(
                 tooltip: 'Attach file',
-                onPressed: onPickAndSendFile,
+                onPressed:
+                    config.disableMedia == true ? null : onPickAndSendFile,
                 icon: const Icon(Icons.attach_file_rounded),
               ),
               Expanded(
@@ -580,10 +592,7 @@ class _ConversationPane extends StatelessWidget {
               gradient: LinearGradient(
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
-                colors: [
-                  Colors.blueGrey.shade50,
-                  Colors.white,
-                ],
+                colors: [Colors.blueGrey.shade50, Colors.white],
               ),
             ),
             child: hasRoom
@@ -677,7 +686,9 @@ class _ConversationPane extends StatelessWidget {
                           border: InputBorder.none,
                           isDense: true,
                           contentPadding: EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 10),
+                            horizontal: 10,
+                            vertical: 10,
+                          ),
                         ),
                       ),
                     ),
@@ -759,8 +770,9 @@ class _MessageBubble extends StatelessWidget {
                       : Border.all(color: Colors.grey.shade200, width: 1),
                   boxShadow: [
                     BoxShadow(
-                      color:
-                          Colors.black.withValues(alpha: isMine ? 0.08 : 0.04),
+                      color: Colors.black.withValues(
+                        alpha: isMine ? 0.08 : 0.04,
+                      ),
                       blurRadius: 8,
                       offset: const Offset(0, 2),
                     ),

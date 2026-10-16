@@ -75,7 +75,8 @@ class ChatUser {
       lastName: user['lastName']?.toString(),
       email: user['email']?.toString(),
       username: user['username']?.toString(),
-      walletAddress: user['walletAddress']?.toString() ??
+      walletAddress:
+          user['walletAddress']?.toString() ??
           defaultWallet['walletAddress']?.toString(),
       xmppUsername: user['xmppUsername']?.toString(),
       xmppPassword: user['xmppPassword']?.toString(),

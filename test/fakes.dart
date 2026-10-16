@@ -46,23 +46,23 @@ class InMemoryStore extends ChatComponentStore {
 
 class _NoopApiClient extends ApiClient {
   _NoopApiClient(ChatComponentConfig config)
-      : super(
-          config: config,
-          readAccessToken: () async => null,
-          readRefreshToken: () async => null,
-          writeTokens: (_, __) async {},
-          clearSession: () async {},
-          log: (_) {},
-        );
+    : super(
+        config: config,
+        readAccessToken: () async => null,
+        readRefreshToken: () async => null,
+        writeTokens: (_, __) async {},
+        clearSession: () async {},
+        log: (_) {},
+      );
 }
 
 class FakeAuthService extends AuthService {
   FakeAuthService()
-      : super(
-          apiClient: _NoopApiClient(const ChatComponentConfig()),
-          config: const ChatComponentConfig(),
-          log: (_) {},
-        );
+    : super(
+        apiClient: _NoopApiClient(const ChatComponentConfig()),
+        config: const ChatComponentConfig(),
+        log: (_) {},
+      );
 
   ChatUser? emailUser;
   ChatUser? jwtUser;
@@ -99,11 +99,11 @@ class FakeAuthService extends AuthService {
 
 class FakeRoomsService extends RoomsService {
   FakeRoomsService({this.rooms = const <ChatRoom>[]})
-      : super(
-          apiClient: _NoopApiClient(const ChatComponentConfig()),
-          config: const ChatComponentConfig(),
-          log: (_) {},
-        );
+    : super(
+        apiClient: _NoopApiClient(const ChatComponentConfig()),
+        config: const ChatComponentConfig(),
+        log: (_) {},
+      );
 
   final List<ChatRoom> rooms;
 

@@ -15,6 +15,10 @@ class ChatComponentState {
     this.rooms = const <ChatRoom>[],
     this.messagesByRoom = const <String, List<ChatMessage>>{},
     this.selectedRoomJid,
+    this.roomEpoch = const <String, int>{},
+    this.pendingSendById = const <String, String>{},
+    this.globalLoading = false,
+    this.loadingText,
   });
 
   final bool isInitialized;
@@ -26,6 +30,10 @@ class ChatComponentState {
   final List<ChatRoom> rooms;
   final Map<String, List<ChatMessage>> messagesByRoom;
   final String? selectedRoomJid;
+  final Map<String, int> roomEpoch;
+  final Map<String, String> pendingSendById;
+  final bool globalLoading;
+  final String? loadingText;
 
   ChatComponentState copyWith({
     bool? isInitialized,
@@ -38,18 +46,27 @@ class ChatComponentState {
     List<ChatRoom>? rooms,
     Map<String, List<ChatMessage>>? messagesByRoom,
     String? selectedRoomJid,
+    Map<String, int>? roomEpoch,
+    Map<String, String>? pendingSendById,
+    bool? globalLoading,
+    String? loadingText,
   }) {
     return ChatComponentState(
       isInitialized: isInitialized ?? this.isInitialized,
       isLoading: isLoading ?? this.isLoading,
       requiresLogin: requiresLogin ?? this.requiresLogin,
-      errorMessage:
-          clearErrorMessage ? null : (errorMessage ?? this.errorMessage),
+      errorMessage: clearErrorMessage
+          ? null
+          : (errorMessage ?? this.errorMessage),
       user: user ?? this.user,
       connectionState: connectionState ?? this.connectionState,
       rooms: rooms ?? this.rooms,
       messagesByRoom: messagesByRoom ?? this.messagesByRoom,
       selectedRoomJid: selectedRoomJid ?? this.selectedRoomJid,
+      roomEpoch: roomEpoch ?? this.roomEpoch,
+      pendingSendById: pendingSendById ?? this.pendingSendById,
+      globalLoading: globalLoading ?? this.globalLoading,
+      loadingText: loadingText ?? this.loadingText,
     );
   }
 }

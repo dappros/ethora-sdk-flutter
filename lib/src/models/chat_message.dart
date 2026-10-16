@@ -11,6 +11,11 @@ class ChatMessage {
     this.isMedia = false,
     this.mediaUrl,
     this.mimeType,
+    this.xmppId,
+    this.timestamp,
+    this.system = false,
+    this.showInChannel = true,
+    this.isReply = false,
   });
 
   final String id;
@@ -22,6 +27,11 @@ class ChatMessage {
   final bool isMedia;
   final String? mediaUrl;
   final String? mimeType;
+  final String? xmppId;
+  final int? timestamp;
+  final bool system;
+  final bool showInChannel;
+  final bool isReply;
 
   ChatMessage copyWith({
     String? id,
@@ -33,6 +43,11 @@ class ChatMessage {
     bool? isMedia,
     String? mediaUrl,
     String? mimeType,
+    String? xmppId,
+    int? timestamp,
+    bool? system,
+    bool? showInChannel,
+    bool? isReply,
   }) {
     return ChatMessage(
       id: id ?? this.id,
@@ -44,6 +59,11 @@ class ChatMessage {
       isMedia: isMedia ?? this.isMedia,
       mediaUrl: mediaUrl ?? this.mediaUrl,
       mimeType: mimeType ?? this.mimeType,
+      xmppId: xmppId ?? this.xmppId,
+      timestamp: timestamp ?? this.timestamp,
+      system: system ?? this.system,
+      showInChannel: showInChannel ?? this.showInChannel,
+      isReply: isReply ?? this.isReply,
     );
   }
 }
