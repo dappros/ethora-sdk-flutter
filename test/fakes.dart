@@ -46,23 +46,23 @@ class InMemoryStore extends ChatComponentStore {
 
 class _NoopApiClient extends ApiClient {
   _NoopApiClient(ChatComponentConfig config)
-    : super(
-        config: config,
-        readAccessToken: () async => null,
-        readRefreshToken: () async => null,
-        writeTokens: (_, __) async {},
-        clearSession: () async {},
-        log: (_) {},
-      );
+      : super(
+          config: config,
+          readAccessToken: () async => null,
+          readRefreshToken: () async => null,
+          writeTokens: (_, __) async {},
+          clearSession: () async {},
+          log: (_) {},
+        );
 }
 
 class FakeAuthService extends AuthService {
   FakeAuthService()
-    : super(
-        apiClient: _NoopApiClient(const ChatComponentConfig()),
-        config: const ChatComponentConfig(),
-        log: (_) {},
-      );
+      : super(
+          apiClient: _NoopApiClient(const ChatComponentConfig()),
+          config: const ChatComponentConfig(),
+          log: (_) {},
+        );
 
   ChatUser? emailUser;
   ChatUser? jwtUser;
@@ -99,11 +99,11 @@ class FakeAuthService extends AuthService {
 
 class FakeRoomsService extends RoomsService {
   FakeRoomsService({this.rooms = const <ChatRoom>[]})
-    : super(
-        apiClient: _NoopApiClient(const ChatComponentConfig()),
-        config: const ChatComponentConfig(),
-        log: (_) {},
-      );
+      : super(
+          apiClient: _NoopApiClient(const ChatComponentConfig()),
+          config: const ChatComponentConfig(),
+          log: (_) {},
+        );
 
   final List<ChatRoom> rooms;
 
@@ -131,24 +131,48 @@ class FakeXmppClient extends XmppClient {
   }
 
   @override
-  Future<void> sendPresenceToRooms(List<String> roomJids) async {}
+  Future<void> sendPresenceToRooms(List<String> roomJids) async {
+    joinedRooms.addAll(roomJids);
+  }
 
   @override
   Future<void> sendRoomPresence(String roomJid) async {}
 
+  final List<String> sentTextIds = <String>[];
+  final List<String> joinedRooms = <String>[];
+
   @override
-  Future<void> requestHistory({
+  Future<MamPage> requestHistory({
     required String roomJid,
     int max = 30,
     String? beforeId,
-  }) async {}
+    String? afterId,
+  }) async =>
+      const MamPage(complete: true);
 
   @override
   Future<void> sendText({
     required String roomJid,
     required String messageId,
     required String text,
+    bool isReply = false,
+    bool showInChannel = false,
+    String mainMessage = '',
+    String langSource = 'en',
+  }) async {
+    sentTextIds.add(messageId);
+  }
+
+  @override
+  Future<Map<String, int>> getChatsPrivateStore() async => <String, int>{};
+
+  @override
+  Future<void> setTimestampToPrivateStore({
+    required String chatId,
+    required int timestamp,
   }) async {}
+
+  void reconnect() => onReconnected?.call();
 
   @override
   Future<void> sendTyping({

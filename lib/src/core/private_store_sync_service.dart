@@ -18,13 +18,11 @@ class PrivateStoreSyncService {
     XmppClient? xmpp, {
     required String roomJid,
     required int timestamp,
-    List<String>? chats,
   }) async {
     if (xmpp == null || roomJid.isEmpty || timestamp <= 0) return;
     await xmpp.setTimestampToPrivateStore(
       chatId: roomJid,
       timestamp: timestamp,
-      chats: chats,
     );
   }
 }

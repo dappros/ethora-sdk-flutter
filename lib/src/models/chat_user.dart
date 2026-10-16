@@ -11,6 +11,8 @@ class ChatUser {
     this.xmppPassword,
     this.token,
     this.refreshToken,
+    this.photoUrl,
+    this.fileToken,
   });
 
   final String? id;
@@ -24,6 +26,10 @@ class ChatUser {
   final String? xmppPassword;
   final String? token;
   final String? refreshToken;
+  final String? photoUrl;
+
+  /// Token appended as `ft` to secure media URLs (login/refresh response).
+  final String? fileToken;
 
   String get displayName {
     final fromName = [
@@ -48,6 +54,8 @@ class ChatUser {
     String? xmppPassword,
     String? token,
     String? refreshToken,
+    String? photoUrl,
+    String? fileToken,
   }) {
     return ChatUser(
       id: id ?? this.id,
@@ -61,6 +69,8 @@ class ChatUser {
       xmppPassword: xmppPassword ?? this.xmppPassword,
       token: token ?? this.token,
       refreshToken: refreshToken ?? this.refreshToken,
+      photoUrl: photoUrl ?? this.photoUrl,
+      fileToken: fileToken ?? this.fileToken,
     );
   }
 
@@ -75,14 +85,26 @@ class ChatUser {
       lastName: user['lastName']?.toString(),
       email: user['email']?.toString(),
       username: user['username']?.toString(),
-      walletAddress:
-          user['walletAddress']?.toString() ??
+      walletAddress: user['walletAddress']?.toString() ??
           defaultWallet['walletAddress']?.toString(),
       xmppUsername: user['xmppUsername']?.toString(),
       xmppPassword: user['xmppPassword']?.toString(),
       token: json['token']?.toString(),
       refreshToken: json['refreshToken']?.toString(),
+      photoUrl: user['profileImage']?.toString(),
+      fileToken: json['fileToken']?.toString(),
     );
+  }
+
+  /// JSON without secrets (xmppPassword, token, refreshToken, fileToken).
+  /// Secrets are kept in secure storage by [ChatComponentStore].
+  Map<String, dynamic> toPublicJson() {
+    final json = toJson();
+    json.remove('xmppPassword');
+    json.remove('token');
+    json.remove('refreshToken');
+    json.remove('fileToken');
+    return json;
   }
 
   Map<String, dynamic> toJson() {
@@ -98,6 +120,8 @@ class ChatUser {
       'xmppPassword': xmppPassword,
       'token': token,
       'refreshToken': refreshToken,
+      'photoUrl': photoUrl,
+      'fileToken': fileToken,
     };
   }
 
@@ -114,6 +138,8 @@ class ChatUser {
       xmppPassword: json['xmppPassword']?.toString(),
       token: json['token']?.toString(),
       refreshToken: json['refreshToken']?.toString(),
+      photoUrl: json['photoUrl']?.toString(),
+      fileToken: json['fileToken']?.toString(),
     );
   }
 }

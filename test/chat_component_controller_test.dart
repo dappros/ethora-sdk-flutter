@@ -72,7 +72,8 @@ void main() {
 
       fakeXmpp.emitIncoming(
         ChatMessage(
-          id: 'server-id',
+          id: '1712000000000001',
+          xmppId: before.last.xmppId,
           roomJid: 'room@conference.xmpp.test',
           text: 'hello',
           user: const ChatUser(username: 'tester'),
@@ -173,14 +174,12 @@ void main() {
     await controller.initialize();
     await controller.sendText('room@conference.xmpp.test', 'hello');
     final localPending = controller
-        .state
-        .value
-        .messagesByRoom['room@conference.xmpp.test']!
-        .last;
+        .state.value.messagesByRoom['room@conference.xmpp.test']!.last;
 
     fakeXmpp.emitIncoming(
       ChatMessage(
-        id: localPending.id,
+        id: '1712000000000002',
+        xmppId: localPending.xmppId,
         roomJid: 'room@conference.xmpp.test',
         text: 'hello',
         user: const ChatUser(username: 'tester'),
@@ -189,7 +188,8 @@ void main() {
     );
     fakeXmpp.emitIncoming(
       ChatMessage(
-        id: localPending.id,
+        id: '1712000000000002',
+        xmppId: localPending.xmppId,
         roomJid: 'room@conference.xmpp.test',
         text: 'hello',
         user: const ChatUser(username: 'tester'),

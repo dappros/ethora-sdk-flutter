@@ -240,6 +240,10 @@ class _ChatLayout extends StatelessWidget {
               room: selectedRoom,
               messages: messages,
               messageController: messageController,
+              isOwnMessage: controller.isOwnMessage,
+              onRetry: (msg) => controller.retryMessage(msg.roomJid, msg.id),
+              onLoadOlder: () =>
+                  controller.loadOlderMessages(selectedRoom?.jid ?? ''),
               onSend: (text) =>
                   controller.sendText(selectedRoom?.jid ?? '', text),
               onPickAndSendFile: () async {
@@ -286,6 +290,10 @@ class _ChatLayout extends StatelessWidget {
             room: selectedRoom,
             messages: messages,
             messageController: messageController,
+            isOwnMessage: controller.isOwnMessage,
+            onRetry: (msg) => controller.retryMessage(msg.roomJid, msg.id),
+            onLoadOlder: () =>
+                controller.loadOlderMessages(selectedRoom?.jid ?? ''),
             onSend: (text) =>
                 controller.sendText(selectedRoom?.jid ?? '', text),
             onPickAndSendFile: () async {
@@ -474,6 +482,9 @@ class _ConversationPane extends StatelessWidget {
     required this.room,
     required this.messages,
     required this.messageController,
+    required this.isOwnMessage,
+    required this.onRetry,
+    required this.onLoadOlder,
     required this.onSend,
     required this.onPickAndSendFile,
     required this.onTyping,
@@ -485,6 +496,9 @@ class _ConversationPane extends StatelessWidget {
   final ChatRoom? room;
   final List<ChatMessage> messages;
   final TextEditingController messageController;
+  final bool Function(ChatMessage message) isOwnMessage;
+  final ValueChanged<ChatMessage> onRetry;
+  final Future<bool> Function() onLoadOlder;
   final ValueChanged<String> onSend;
   final Future<void> Function() onPickAndSendFile;
   final ValueChanged<bool> onTyping;
@@ -493,8 +507,9 @@ class _ConversationPane extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final hasRoom = room != null;
-    final currentUsername =
-        state.user?.username ?? state.user?.xmppUsername ?? state.user?.id;
+    final visible = messages
+        .where((m) => !m.isDeleted && (m.showInChannel || !m.isReply))
+        .toList();
     final connectionColor = switch (state.connectionState) {
       ChatConnectionState.online => Colors.green.shade600,
       ChatConnectionState.connecting => Colors.orange.shade600,
@@ -596,7 +611,7 @@ class _ConversationPane extends StatelessWidget {
               ),
             ),
             child: hasRoom
-                ? (messages.isEmpty
+                ? (visible.isEmpty
                     ? Center(
                         child: Container(
                           padding: const EdgeInsets.all(20),
@@ -627,17 +642,32 @@ class _ConversationPane extends StatelessWidget {
                           ),
                         ),
                       )
-                    : ListView.builder(
-                        reverse: true,
-                        padding: const EdgeInsets.fromLTRB(14, 14, 14, 10),
-                        itemCount: messages.length,
-                        itemBuilder: (context, index) {
-                          final msg = messages[messages.length - 1 - index];
-                          final isMine = currentUsername != null &&
-                              (msg.user.username == currentUsername ||
-                                  msg.user.xmppUsername == currentUsername);
-                          return _MessageBubble(message: msg, isMine: isMine);
+                    : NotificationListener<ScrollNotification>(
+                        onNotification: (notification) {
+                          // reversed list: maxScrollExtent is the oldest edge
+                          if (notification.metrics.pixels >=
+                                  notification.metrics.maxScrollExtent - 80 &&
+                              room?.historyComplete != true) {
+                            onLoadOlder();
+                          }
+                          return false;
                         },
+                        child: ListView.builder(
+                          reverse: true,
+                          padding: const EdgeInsets.fromLTRB(14, 14, 14, 10),
+                          itemCount: visible.length,
+                          itemBuilder: (context, index) {
+                            final msg = visible[visible.length - 1 - index];
+                            if (msg.system) {
+                              return _SystemPill(text: msg.text);
+                            }
+                            return _MessageBubble(
+                              message: msg,
+                              isMine: isOwnMessage(msg),
+                              onRetry: () => onRetry(msg),
+                            );
+                          },
+                        ),
                       ))
                 : const Center(child: Text('Select a room to start chatting')),
           ),
@@ -718,10 +748,15 @@ class _ConversationPane extends StatelessWidget {
 }
 
 class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({required this.message, required this.isMine});
+  const _MessageBubble({
+    required this.message,
+    required this.isMine,
+    required this.onRetry,
+  });
 
   final ChatMessage message;
   final bool isMine;
+  final VoidCallback onRetry;
 
   @override
   Widget build(BuildContext context) {
@@ -795,7 +830,10 @@ class _MessageBubble extends StatelessWidget {
                       ),
                     Text(
                       message.isMedia
-                          ? '[media] ${message.mediaUrl}'
+                          ? (message.data['caption'] ??
+                              message.data['originalName'] ??
+                              message.data['fileName'] ??
+                              'media')
                           : message.text,
                       style: TextStyle(color: fg),
                     ),
@@ -812,6 +850,33 @@ class _MessageBubble extends StatelessWidget {
                                 : Colors.grey.shade500,
                           ),
                         ),
+                        if (message.isEdited) ...[
+                          const SizedBox(width: 6),
+                          Text(
+                            '(edited)',
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: isMine
+                                  ? Colors.white.withValues(alpha: 0.78)
+                                  : Colors.grey.shade500,
+                            ),
+                          ),
+                        ],
+                        if (message.failed) ...[
+                          const SizedBox(width: 6),
+                          GestureDetector(
+                            onTap: onRetry,
+                            child: Text(
+                              'failed, tap to retry',
+                              style: TextStyle(
+                                fontSize: 10,
+                                color:
+                                    isMine ? Colors.white : Colors.red.shade700,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        ],
                         if (message.pending) ...[
                           const SizedBox(width: 6),
                           Text(
@@ -901,4 +966,32 @@ class _CountBadge extends StatelessWidget {
 
 extension _FirstOrNullExt<T> on Iterable<T> {
   T? get firstOrNull => isEmpty ? null : first;
+}
+
+/// System messages and the "New Messages" delimiter render as a centered
+/// pill like web SystemMessage, never as a chat bubble.
+class _SystemPill extends StatelessWidget {
+  const _SystemPill({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Center(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          decoration: BoxDecoration(
+            color: Colors.blueGrey.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Text(
+            text,
+            style: TextStyle(fontSize: 12, color: Colors.blueGrey.shade700),
+          ),
+        ),
+      ),
+    );
+  }
 }

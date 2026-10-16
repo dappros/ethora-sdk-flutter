@@ -1,5 +1,5 @@
 import 'package:ethora_sdk_flutter/ethora_sdk_flutter.dart';
-import 'package:ethora_sdk_flutter/src/ui/app.dart';
+import 'demo_app.dart';
 import 'package:flutter/widgets.dart';
 
 const kEthoraChatAppId = '646cc8dc96d4a4dc8f7b2f2d';

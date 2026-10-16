@@ -18,6 +18,7 @@ import 'unread_service.dart';
 import '../networking/api_client.dart';
 import '../networking/auth_service.dart';
 import '../networking/rooms_service.dart';
+import '../networking/stanza_parser.dart';
 import '../networking/xmpp_client.dart';
 
 typedef XmppClientFactory = XmppClient Function({
@@ -35,13 +36,15 @@ class _PendingHeapItem {
     required this.text,
   })  : kind = _HeapKind.text,
         mediaUrl = null,
-        mimeType = null;
+        mimeType = null,
+        file = null;
 
   const _PendingHeapItem.media({
     required this.messageId,
     required this.roomJid,
     required this.mediaUrl,
     required this.mimeType,
+    required this.file,
   })  : kind = _HeapKind.media,
         text = null;
 
@@ -51,7 +54,16 @@ class _PendingHeapItem {
   final String? text;
   final String? mediaUrl;
   final String? mimeType;
+  final Map<String, dynamic>? file;
 }
+
+/// Pending text turns into "failed" after this long without a server echo
+/// (web PENDING_WATCHDOG_MS / MEDIA_PENDING_WATCHDOG_MS).
+const Duration kTextPendingWatchdog = Duration(seconds: 10);
+const Duration kMediaPendingWatchdog = Duration(seconds: 30);
+
+/// A typer is dropped if no "paused" arrives within this window.
+const Duration kTypingExpiry = Duration(seconds: 8);
 
 class ChatComponentController {
   ChatComponentController({
@@ -73,7 +85,7 @@ class ChatComponentController {
               await _store.setRefreshToken(refreshToken);
             }
           },
-          clearSession: _store.clearSession,
+          clearSession: _onSessionExpired,
           log: _emitLog,
         );
     _authService = authService ??
@@ -96,6 +108,10 @@ class ChatComponentController {
   final List<_PendingHeapItem> _pendingHeap = <_PendingHeapItem>[];
   final Set<String> _sentCallbackDeliveredFor = <String>{};
   final Map<String, int> _roomEpoch = <String, int>{};
+  final Map<String, Timer> _pendingWatchdogs = <String, Timer>{};
+  final Map<String, Map<String, (String, Timer)>> _typers =
+      <String, Map<String, (String, Timer)>>{};
+  final Set<String> _historyInFlight = <String>{};
 
   late final ApiClient _apiClient;
   late final AuthService _authService;
@@ -103,6 +119,8 @@ class ChatComponentController {
   XmppClient? _xmpp;
   late final XmppClientFactory _xmppClientFactory;
   Timer? _typingStopTimer;
+  Future<void>? _initializing;
+  bool _disposed = false;
 
   final ValueNotifier<ChatComponentState> state =
       ValueNotifier<ChatComponentState>(const ChatComponentState());
@@ -111,7 +129,16 @@ class ChatComponentController {
 
   Stream<ChatLogEvent> get logs => _logController.stream;
 
-  Future<void> initialize() async {
+  /// Safe to call more than once: concurrent calls share one run, and a
+  /// finished run is not repeated until [logout].
+  Future<void> initialize() {
+    if (state.value.isInitialized) return Future<void>.value();
+    return _initializing ??= _initialize().whenComplete(() {
+      _initializing = null;
+    });
+  }
+
+  Future<void> _initialize() async {
     state.value = state.value.copyWith(
       isLoading: true,
       globalLoading: true,
@@ -134,23 +161,15 @@ class ChatComponentController {
         user = await config.customLogin!.loginFunction();
       }
 
-      if (user == null && config.defaultLogin == true) {
-        state.value = state.value.copyWith(
-          isLoading: false,
-          globalLoading: false,
-          isInitialized: false,
-          requiresLogin: true,
-        );
-        return;
-      }
-
       if (user == null) {
         state.value = state.value.copyWith(
           isLoading: false,
           globalLoading: false,
           isInitialized: false,
           requiresLogin: true,
-          errorMessage: 'No authentication strategy succeeded.',
+          errorMessage: config.defaultLogin == true
+              ? null
+              : 'No authentication strategy succeeded.',
         );
         return;
       }
@@ -164,14 +183,8 @@ class ChatComponentController {
         isInitialized: false,
         errorMessage: e.toString(),
       );
-      _emitLog(
-        ChatLogEvent(
-          level: ChatLogLevel.error,
-          category: ChatLogCategory.system,
-          message: 'Initialization failed: $e',
-          timestamp: DateTime.now(),
-        ),
-      );
+      _log(ChatLogLevel.error, ChatLogCategory.system,
+          'Initialization failed: $e');
     }
   }
 
@@ -214,6 +227,26 @@ class ChatComponentController {
     state.value = state.value.copyWith(user: user, requiresLogin: false);
   }
 
+  String get _myLocal {
+    final user = state.value.user;
+    return localPart(
+      user?.xmppUsername ?? user?.walletAddress ?? user?.username ?? '',
+    ).toLowerCase();
+  }
+
+  /// True when [message] was written by the signed-in user. Matches web:
+  /// the MUC nick (occupant resource) or `<data senderJID>` localpart.
+  bool isOwnMessage(ChatMessage message) {
+    final me = _myLocal;
+    if (me.isEmpty) return false;
+    final sender = localPart(
+      message.user.xmppUsername ?? message.user.id ?? '',
+    ).toLowerCase();
+    if (sender == me) return true;
+    final senderJid = localPart(message.data['senderJID']).toLowerCase();
+    return senderJid.isNotEmpty && senderJid == me;
+  }
+
   Future<void> _initializeRuntime() async {
     final user = state.value.user;
     if (user == null) return;
@@ -254,20 +287,16 @@ class ChatComponentController {
         _historyQueue.resume();
       }
     };
-    xmpp.onReconnected = () {
-      recoverPendingHeap();
+    xmpp.onReconnected = () => unawaited(_onReconnected());
+    xmpp.onAuthFailed = (error) {
+      state.value = state.value.copyWith(errorMessage: error.toString());
+      _log(ChatLogLevel.error, ChatLogCategory.xmpp, error.toString());
     };
     xmpp.onMessage = _handleIncomingMessage;
-    xmpp.onTyping = (roomJid, composingUsers) {
-      final updatedRooms = state.value.rooms
-          .map(
-            (room) => room.jid == roomJid
-                ? room.copyWith(composingList: composingUsers)
-                : room,
-          )
-          .toList();
-      state.value = state.value.copyWith(rooms: updatedRooms);
-    };
+    xmpp.onEdit = _handleEdit;
+    xmpp.onDelete = _handleDelete;
+    xmpp.onReaction = _handleReaction;
+    xmpp.onTyping = _handleTyping;
 
     await xmpp.connect();
 
@@ -282,11 +311,7 @@ class ChatComponentController {
     }
 
     state.value = state.value.copyWith(rooms: rooms);
-    final roomJids = rooms
-        .map((e) => e.jid.trim())
-        .where((jid) => jid.isNotEmpty)
-        .toSet()
-        .toList();
+    final roomJids = _roomJids();
     if (roomJids.isNotEmpty) {
       await xmpp.sendPresenceToRooms(roomJids);
     }
@@ -305,6 +330,29 @@ class ChatComponentController {
     );
   }
 
+  List<String> _roomJids() => state.value.rooms
+      .map((e) => e.jid.trim())
+      .where((jid) => jid.isNotEmpty)
+      .toSet()
+      .toList();
+
+  /// After a dropped socket: re-join every room, catch up the newest page
+  /// of each (selected room first) and re-send what was still pending.
+  Future<void> _onReconnected() async {
+    final xmpp = _xmpp;
+    if (xmpp == null) return;
+    final roomJids = _roomJids();
+    await xmpp.sendPresenceToRooms(roomJids);
+    final selected = state.value.selectedRoomJid;
+    if (selected != null) {
+      await loadHistory(roomJid: selected, source: HistorySource.active);
+    }
+    for (final jid in roomJids.where((jid) => jid != selected)) {
+      unawaited(loadHistory(roomJid: jid, source: HistorySource.background));
+    }
+    await recoverPendingHeap();
+  }
+
   Future<void> selectRoom(String roomJid) async {
     final normalized = roomJid.trim();
     if (normalized.isEmpty) return;
@@ -321,16 +369,28 @@ class ChatComponentController {
     _recalculateUnread();
   }
 
+  String _newMessageId(String prefix) {
+    final rnd = Random();
+    final suffix = List<String>.generate(
+      4,
+      (_) => rnd.nextInt(1 << 16).toRadixString(16).padLeft(4, '0'),
+    ).join();
+    return '$prefix-${DateTime.now().millisecondsSinceEpoch}-$suffix';
+  }
+
   Future<void> sendText(String roomJid, String text) async {
     final user = state.value.user;
     if (user == null || text.trim().isEmpty) return;
-    final messageId = _newMessageId();
+    final messageId = _newMessageId('send-text-message');
+    final now = DateTime.now().millisecondsSinceEpoch;
     final pending = ChatMessage(
       id: messageId,
+      xmppId: messageId,
       roomJid: roomJid,
       text: text,
       user: user,
-      createdAtMs: DateTime.now().millisecondsSinceEpoch,
+      createdAtMs: now,
+      timestamp: now,
       pending: true,
     );
     _appendPendingMessage(pending);
@@ -338,13 +398,19 @@ class ChatComponentController {
       _PendingHeapItem.text(messageId: messageId, roomJid: roomJid, text: text),
     );
     _setPendingSendState(messageId, roomJid);
+    _armWatchdog(messageId, roomJid, kTextPendingWatchdog);
     promoteRoomHistory(roomJid);
+    _enqueueText(messageId, roomJid, text);
+  }
 
+  void _enqueueText(String messageId, String roomJid, String text) {
     unawaited(_sendQueue.enqueue(
       id: messageId,
       roomJid: roomJid,
       task: () async {
-        await _xmpp?.sendText(
+        final xmpp = _xmpp;
+        if (xmpp == null) return false;
+        await xmpp.sendText(
           roomJid: roomJid,
           messageId: messageId,
           text: text,
@@ -383,13 +449,16 @@ class ChatComponentController {
       throw Exception('Media upload returned empty location');
     }
 
-    final messageId = _newMessageId();
+    final messageId = _newMessageId('send-media-message');
+    final now = DateTime.now().millisecondsSinceEpoch;
     final pending = ChatMessage(
       id: messageId,
+      xmppId: messageId,
       roomJid: roomJid,
-      text: '[media] $mediaUrl',
+      text: 'media',
       user: user,
-      createdAtMs: DateTime.now().millisecondsSinceEpoch,
+      createdAtMs: now,
+      timestamp: now,
       pending: true,
       isMedia: true,
       mediaUrl: mediaUrl,
@@ -402,24 +471,79 @@ class ChatComponentController {
         roomJid: roomJid,
         mediaUrl: mediaUrl,
         mimeType: mimeType,
+        file: fileData,
       ),
     );
     _setPendingSendState(messageId, roomJid);
+    _armWatchdog(messageId, roomJid, kMediaPendingWatchdog);
     promoteRoomHistory(roomJid);
+    _enqueueMedia(messageId, roomJid, mediaUrl, mimeType, fileData);
+  }
 
+  void _enqueueMedia(
+    String messageId,
+    String roomJid,
+    String mediaUrl,
+    String mimeType,
+    Map<String, dynamic> file,
+  ) {
     unawaited(_sendQueue.enqueue(
       id: messageId,
       roomJid: roomJid,
       task: () async {
-        await _xmpp?.sendMedia(
+        final xmpp = _xmpp;
+        if (xmpp == null) return false;
+        await xmpp.sendMedia(
           roomJid: roomJid,
           messageId: messageId,
           mediaUrl: mediaUrl,
           mimeType: mimeType,
+          file: file,
         );
         return true;
       },
     ));
+  }
+
+  /// Re-sends a failed message with the same id, like web resendMessage
+  /// with reuseId, so a late echo of the first attempt still reconciles.
+  Future<void> retryMessage(String roomJid, String messageId) async {
+    final item = _pendingHeap
+        .where((e) => e.messageId == messageId && e.roomJid == roomJid)
+        .firstOrNull;
+    if (item == null) return;
+    _updateMessage(
+        roomJid, messageId, (m) => m.copyWith(failed: false, pending: true));
+    _armWatchdog(
+      messageId,
+      roomJid,
+      item.kind == _HeapKind.text
+          ? kTextPendingWatchdog
+          : kMediaPendingWatchdog,
+    );
+    if (item.kind == _HeapKind.text) {
+      _enqueueText(messageId, roomJid, item.text ?? '');
+    } else {
+      _enqueueMedia(
+        messageId,
+        roomJid,
+        item.mediaUrl ?? '',
+        item.mimeType ?? 'application/octet-stream',
+        item.file ?? const <String, dynamic>{},
+      );
+    }
+  }
+
+  void _armWatchdog(String messageId, String roomJid, Duration timeout) {
+    _pendingWatchdogs.remove(messageId)?.cancel();
+    _pendingWatchdogs[messageId] = Timer(timeout, () {
+      _pendingWatchdogs.remove(messageId);
+      _updateMessage(roomJid, messageId, (m) {
+        if (!m.pending) return m;
+        return m.copyWith(pending: false, failed: true);
+      });
+      _recalculateUnread();
+    });
   }
 
   Future<void> setTyping(String roomJid, bool isTyping) async {
@@ -433,13 +557,15 @@ class ChatComponentController {
     }
   }
 
-  Future<void> loadHistory({
+  /// Loads one MAM page. Without [beforeId] it fetches the newest page.
+  Future<MamPage> loadHistory({
     required String roomJid,
     int max = 30,
     String? beforeId,
     HistorySource source = HistorySource.normal,
   }) async {
     final epoch = _roomEpoch[roomJid] ?? 0;
+    var page = const MamPage();
     final task = HistoryTask(
       id: 'history-${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(99999)}',
       roomJid: roomJid,
@@ -447,7 +573,9 @@ class ChatComponentController {
       epoch: epoch,
       createdAt: DateTime.now().millisecondsSinceEpoch,
       run: () async {
-        await _xmpp?.requestHistory(
+        final xmpp = _xmpp;
+        if (xmpp == null) return;
+        page = await xmpp.requestHistory(
           roomJid: roomJid,
           max: max,
           beforeId: beforeId,
@@ -456,6 +584,45 @@ class ChatComponentController {
       completer: Completer<void>(),
     );
     await _historyQueue.enqueue(task);
+    if (beforeId != null && page.complete) {
+      _updateRoom(roomJid, (room) => room.copyWith(historyComplete: true));
+    }
+    return page;
+  }
+
+  /// Loads the page before the oldest archived message of [roomJid]
+  /// (scroll-to-top). Returns false when the archive is exhausted or a load
+  /// is already running.
+  Future<bool> loadOlderMessages(String roomJid, {int max = 30}) async {
+    final room = state.value.rooms.where((r) => r.jid == roomJid).firstOrNull;
+    if (room?.historyComplete == true) return false;
+    if (!_historyInFlight.add(roomJid)) return false;
+    try {
+      final oldest =
+          (state.value.messagesByRoom[roomJid] ?? const <ChatMessage>[])
+              .where((m) => !m.pending && !m.system && m.id != 'delimiter-new')
+              .map((m) => m.id)
+              .where((id) => RegExp(r'^\d+$').hasMatch(id))
+              .fold<String?>(null, (min, id) {
+        if (min == null) return id;
+        return (BigInt.tryParse(id) ?? BigInt.zero) <
+                (BigInt.tryParse(min) ?? BigInt.zero)
+            ? id
+            : min;
+      });
+      final page = await loadHistory(
+        roomJid: roomJid,
+        max: max,
+        beforeId: oldest,
+        source: HistorySource.active,
+      );
+      if (oldest == null && page.complete) {
+        _updateRoom(roomJid, (r) => r.copyWith(historyComplete: true));
+      }
+      return !page.complete && !page.error;
+    } finally {
+      _historyInFlight.remove(roomJid);
+    }
   }
 
   Future<void> markRoomViewed(String roomJid, {int? timestampMs}) async {
@@ -481,12 +648,7 @@ class ChatComponentController {
       messagesByRoom: map,
       rooms: updatedRooms,
     );
-    await _privateStoreSync.write(
-      _xmpp,
-      roomJid: roomJid,
-      timestamp: ts,
-      chats: state.value.rooms.map((e) => e.jid).toList(),
-    );
+    await _privateStoreSync.write(_xmpp, roomJid: roomJid, timestamp: ts);
   }
 
   void promoteRoomHistory(String roomJid) {
@@ -513,32 +675,15 @@ class ChatComponentController {
     final snapshot = List<_PendingHeapItem>.from(_pendingHeap);
     for (final item in snapshot) {
       if (item.kind == _HeapKind.text) {
-        unawaited(_sendQueue.enqueue(
-          id: item.messageId,
-          roomJid: item.roomJid,
-          task: () async {
-            await _xmpp?.sendText(
-              roomJid: item.roomJid,
-              messageId: item.messageId,
-              text: item.text ?? '',
-            );
-            return true;
-          },
-        ));
+        _enqueueText(item.messageId, item.roomJid, item.text ?? '');
       } else {
-        unawaited(_sendQueue.enqueue(
-          id: item.messageId,
-          roomJid: item.roomJid,
-          task: () async {
-            await _xmpp?.sendMedia(
-              roomJid: item.roomJid,
-              messageId: item.messageId,
-              mediaUrl: item.mediaUrl ?? '',
-              mimeType: item.mimeType ?? 'application/octet-stream',
-            );
-            return true;
-          },
-        ));
+        _enqueueMedia(
+          item.messageId,
+          item.roomJid,
+          item.mediaUrl ?? '',
+          item.mimeType ?? 'application/octet-stream',
+          item.file ?? const <String, dynamic>{},
+        );
       }
     }
   }
@@ -547,15 +692,46 @@ class ChatComponentController {
     _typingStopTimer?.cancel();
     await _xmpp?.disconnect();
     _xmpp = null;
-    _pendingHeap.clear();
-    _sendQueue.clear();
-    _historyQueue.clear();
+    _resetRuntimeState();
     await _store.clearSession();
     state.value = const ChatComponentState(
       isInitialized: false,
       requiresLogin: true,
       connectionState: ChatConnectionState.offline,
     );
+  }
+
+  /// Called by [ApiClient] when a token refresh failed for good: the
+  /// session is gone, so the UI must show the login state.
+  Future<void> _onSessionExpired() async {
+    await _store.clearSession();
+    if (_disposed) return;
+    await _xmpp?.disconnect();
+    _xmpp = null;
+    _resetRuntimeState();
+    state.value = const ChatComponentState(
+      isInitialized: false,
+      requiresLogin: true,
+      connectionState: ChatConnectionState.offline,
+      errorMessage: 'Session expired. Please sign in again.',
+    );
+  }
+
+  void _resetRuntimeState() {
+    _pendingHeap.clear();
+    _sendQueue.clear();
+    _historyQueue.clear();
+    for (final t in _pendingWatchdogs.values) {
+      t.cancel();
+    }
+    _pendingWatchdogs.clear();
+    for (final room in _typers.values) {
+      for (final entry in room.values) {
+        entry.$2.cancel();
+      }
+    }
+    _typers.clear();
+    _historyInFlight.clear();
   }
 
   void _appendPendingMessage(ChatMessage message) {
@@ -605,52 +781,170 @@ class ChatComponentController {
       ...(map[incoming.roomJid] ?? <ChatMessage>[]),
     ];
 
-    final pendingIndex = roomMessages.indexWhere(
-      (m) =>
-          m.pending == true &&
-          (m.id == incoming.id ||
-              (m.xmppId != null && m.xmppId == incoming.id) ||
-              m.text == incoming.text),
-    );
+    // The echo of our own send carries our outer id as xmppId.
+    final pendingIndex = incoming.xmppId == null
+        ? -1
+        : roomMessages.indexWhere(
+            (m) => m.xmppId == incoming.xmppId && (m.pending || m.failed),
+          );
 
-    ChatMessage ackedMessage = incoming;
+    ChatMessage? acked;
     if (pendingIndex >= 0) {
-      final pendingLocal = roomMessages[pendingIndex];
-      ackedMessage = pendingLocal.copyWith(
-        pending: false,
-        id: incoming.id,
-        timestamp: incoming.timestamp ?? incoming.createdAtMs,
-      );
-      roomMessages[pendingIndex] = ackedMessage;
-      _pendingHeap.removeWhere((item) => item.messageId == pendingLocal.id);
-      _clearPendingSendState(pendingLocal.id);
+      final local = roomMessages[pendingIndex];
+      acked = incoming.copyWith(user: local.user);
+      roomMessages[pendingIndex] = acked;
+      _pendingHeap.removeWhere((item) => item.messageId == local.xmppId);
+      _pendingWatchdogs.remove(local.xmppId)?.cancel();
+      _clearPendingSendState(local.xmppId!);
     } else {
-      roomMessages.add(incoming);
+      final dupIndex = roomMessages.indexWhere(
+        (m) =>
+            m.id == incoming.id ||
+            (incoming.xmppId != null &&
+                m.xmppId == incoming.xmppId &&
+                !m.pending),
+      );
+      if (dupIndex >= 0) {
+        final existing = roomMessages[dupIndex];
+        roomMessages[dupIndex] = incoming.copyWith(
+          reactions: existing.reactions.isNotEmpty ? existing.reactions : null,
+          isEdited: existing.isEdited ? true : null,
+          text: existing.isEdited ? existing.text : null,
+        );
+      } else {
+        roomMessages.add(incoming);
+      }
     }
+    roomMessages.sort((a, b) => a.createdAtMs.compareTo(b.createdAtMs));
 
     final targetRoom = state.value.rooms.firstWhere(
       (room) => room.jid == incoming.roomJid,
       orElse: () => ChatRoom(jid: incoming.roomJid, title: incoming.roomJid),
     );
-    final normalized = _unreadService.normalizeDelimiterPosition(
+    map[incoming.roomJid] = _unreadService.normalizeDelimiterPosition(
       roomMessages,
       targetRoom.lastViewedTimestamp,
       incoming.roomJid,
     );
-    map[incoming.roomJid] = normalized;
     state.value = state.value.copyWith(messagesByRoom: map);
     _recalculateUnread();
-    if (pendingIndex >= 0) {
-      unawaited(_deliverOnMessageSent(ackedMessage));
+    if (acked != null) {
+      unawaited(_deliverOnMessageSent(acked));
     }
   }
 
+  void _handleEdit(ParsedEdit edit) {
+    _updateMessage(
+      edit.roomJid,
+      edit.targetId,
+      (m) => m.copyWith(text: edit.text, isEdited: true),
+    );
+  }
+
+  void _handleDelete(ParsedDelete delete) {
+    _updateMessage(
+      delete.roomJid,
+      delete.targetId,
+      (m) => m
+          .copyWith(isDeleted: true, reactions: const <String, ChatReaction>{}),
+    );
+    _recalculateUnread();
+  }
+
+  void _handleReaction(ParsedReaction event) {
+    _updateMessage(event.roomJid, event.targetId, (m) {
+      final current = m.reactions[event.reactor];
+      final currentTs = timestampFromUnknown(current?.ts);
+      final nextTs = timestampFromUnknown(event.reaction.ts);
+      if (current != null &&
+          currentTs > 0 &&
+          nextTs > 0 &&
+          nextTs < currentTs) {
+        return m;
+      }
+      return m.copyWith(
+        reactions: <String, ChatReaction>{
+          ...m.reactions,
+          event.reactor: event.reaction,
+        },
+      );
+    });
+  }
+
+  void _handleTyping(ParsedTyping event) {
+    final me = _myLocal;
+    if (me.isNotEmpty &&
+        (event.nick.toLowerCase() == me ||
+            localPart(event.senderJid).toLowerCase() == me)) {
+      return;
+    }
+    final room =
+        _typers.putIfAbsent(event.roomJid, () => <String, (String, Timer)>{});
+    room.remove(event.nick)?.$2.cancel();
+    if (event.composing) {
+      final name = event.fullName.trim().split(' ').first;
+      room[event.nick] = (
+        name.isEmpty ? event.nick : name,
+        Timer(kTypingExpiry, () {
+          room.remove(event.nick);
+          _publishTypers(event.roomJid);
+        }),
+      );
+    }
+    _publishTypers(event.roomJid);
+  }
+
+  void _publishTypers(String roomJid) {
+    final names = (_typers[roomJid] ?? const <String, (String, Timer)>{})
+        .values
+        .map((e) => e.$1)
+        .toList();
+    _updateRoom(roomJid, (room) => room.copyWith(composingList: names));
+  }
+
+  void _updateRoom(String roomJid, ChatRoom Function(ChatRoom room) update) {
+    if (_disposed) return;
+    state.value = state.value.copyWith(
+      rooms: state.value.rooms
+          .map((room) => room.jid == roomJid ? update(room) : room)
+          .toList(),
+    );
+  }
+
+  void _updateMessage(
+    String roomJid,
+    String messageId,
+    ChatMessage Function(ChatMessage message) update,
+  ) {
+    if (_disposed) return;
+    final list = state.value.messagesByRoom[roomJid];
+    if (list == null) return;
+    var changed = false;
+    final next = list.map((m) {
+      if (m.id == messageId || m.xmppId == messageId) {
+        changed = true;
+        return update(m);
+      }
+      return m;
+    }).toList();
+    if (!changed) return;
+    state.value = state.value.copyWith(
+      messagesByRoom: <String, List<ChatMessage>>{
+        ...state.value.messagesByRoom,
+        roomJid: next,
+      },
+    );
+  }
+
   void _recalculateUnread() {
+    if (_disposed) return;
     final selectedRoomJid = state.value.selectedRoomJid;
     final user = state.value.user;
     final updatedRooms = state.value.rooms.map((room) {
       final messages =
-          state.value.messagesByRoom[room.jid] ?? const <ChatMessage>[];
+          (state.value.messagesByRoom[room.jid] ?? const <ChatMessage>[])
+              .where((m) => !m.isDeleted)
+              .toList();
       final unread = _unreadService.computeUnreadForRoom(
         room: room,
         messages: messages,
@@ -666,19 +960,27 @@ class ChatComponentController {
     state.value = state.value.copyWith(rooms: updatedRooms);
   }
 
-  String _newMessageId() {
-    return 'flutter-${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(100000)}';
+  void _log(ChatLogLevel level, ChatLogCategory category, String message) {
+    _emitLog(
+      ChatLogEvent(
+        level: level,
+        category: category,
+        message: message,
+        timestamp: DateTime.now(),
+      ),
+    );
   }
 
   void _emitLog(ChatLogEvent event) {
+    if (_logController.isClosed) return;
     _logController.add(event);
   }
 
   void dispose() {
+    _disposed = true;
     _typingStopTimer?.cancel();
     _xmpp?.disconnect();
-    _sendQueue.clear();
-    _historyQueue.clear();
+    _resetRuntimeState();
     _logController.close();
     state.dispose();
   }

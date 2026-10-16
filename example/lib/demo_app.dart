@@ -2,11 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
-import '../core/chat_component_controller.dart';
-import '../core/chat_component_log.dart';
-import '../core/chat_component_state.dart';
-import '../models/chat_component_config.dart';
-import 'chat_component_widget.dart';
+import 'package:ethora_sdk_flutter/ethora_sdk_flutter.dart';
 
 class ChatComponentDemoApp extends StatefulWidget {
   const ChatComponentDemoApp({

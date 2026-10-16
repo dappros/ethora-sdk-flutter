@@ -55,9 +55,8 @@ class ChatComponentState {
       isInitialized: isInitialized ?? this.isInitialized,
       isLoading: isLoading ?? this.isLoading,
       requiresLogin: requiresLogin ?? this.requiresLogin,
-      errorMessage: clearErrorMessage
-          ? null
-          : (errorMessage ?? this.errorMessage),
+      errorMessage:
+          clearErrorMessage ? null : (errorMessage ?? this.errorMessage),
       user: user ?? this.user,
       connectionState: connectionState ?? this.connectionState,
       rooms: rooms ?? this.rooms,

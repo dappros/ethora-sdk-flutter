@@ -19,9 +19,8 @@ class ConfigResolver {
   const ConfigResolver();
 
   ResolvedConfig resolve(ChatComponentConfig config) {
-    final forcedRoomJid = (config.roomJID ?? '').trim().isEmpty
-        ? null
-        : config.roomJID!.trim();
+    final forcedRoomJid =
+        (config.roomJID ?? '').trim().isEmpty ? null : config.roomJID!.trim();
     return ResolvedConfig(
       normalizedBaseUrl: config.normalizedBaseUrl,
       xmppEndpoint: config.xmppSettings?.endpoint ?? '',
