@@ -3,7 +3,7 @@ import 'demo_app.dart';
 import 'package:flutter/widgets.dart';
 
 const kEthoraChatAppId = '646cc8dc96d4a4dc8f7b2f2d';
-const kEthoraApiUrl = 'https://api.ethoradev.com/v1';
+const kEthoraApiUrl = 'https://api.chat.ethora.com/v1';
 const kEthoraApiToken = 'JWT token';
 
 void main() {
@@ -14,7 +14,14 @@ void main() {
     customAppToken: kEthoraApiToken,
     defaultLogin: true,
     initBeforeLoad: true,
-    disableMedia: true,
+    colorScheme: ChatColorScheme.system,
+    enableMessageSearch: true,
+    videoCalls: const VideoCallsConfig(
+      enabled: true,
+      livekitUrl: 'wss://livekit.example.com',
+      enableAudioCalls: true,
+    ),
+    settings: const ChatSettingsConfig(changePassword: true),
     refreshTokens: const RefreshTokensConfig(enabled: true),
     jwtLogin: const JwtLoginConfig(enabled: true, token: 'token'),
     userLogin: const UserLoginConfig(enabled: true, user: null),
@@ -31,9 +38,9 @@ void main() {
       ),
     ),
     xmppSettings: const XmppSettings(
-      devServer: 'wss://xmpp.ethoradev.com:5443/ws',
-      host: 'xmpp.ethoradev.com',
-      conference: 'conference.xmpp.ethoradev.com',
+      xmppServerUrl: 'wss://xmpp.chat.ethora.com/ws',
+      host: 'xmpp.chat.ethora.com',
+      conference: 'conference.xmpp.chat.ethora.com',
       xmppPingOnSendEnabled: true,
     ),
   );
