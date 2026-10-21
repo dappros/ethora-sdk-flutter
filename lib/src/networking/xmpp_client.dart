@@ -11,6 +11,7 @@ import '../core/chat_component_state.dart';
 import '../models/chat_component_config.dart';
 import '../models/chat_message.dart';
 import '../models/chat_user.dart';
+import '../models/media_attachment.dart';
 import 'stanza_parser.dart';
 
 typedef XmppMessageCallback = void Function(ChatMessage message);
@@ -57,6 +58,8 @@ class MamPage {
     this.count = 0,
     this.error = false,
     this.timedOut = false,
+    this.messages = const <ChatMessage>[],
+    this.modifiers = const <ParsedStanza>[],
   });
 
   final bool complete;
@@ -67,6 +70,14 @@ class MamPage {
   final int count;
   final bool error;
   final bool timedOut;
+
+  /// The archived rows of this page, oldest first, as received.
+  final List<ChatMessage> messages;
+
+  /// Edits, deletes and reactions that arrived with a silent page
+  /// (`deliver: false`); a delivering page applies them through the
+  /// callbacks instead.
+  final List<ParsedStanza> modifiers;
 }
 
 class XmppAuthException implements Exception {
@@ -90,7 +101,10 @@ class XmppClient {
   }) : _transportFactory = transportFactory ?? WebSocketXmppTransport.new;
 
   final XmppSettings settings;
-  final ChatUser user;
+
+  /// The session user. Not final: [updateXmppPassword] swaps the SASL
+  /// password after a credential recovery.
+  ChatUser user;
   final void Function(ChatLogEvent event) log;
   final XmppTransportFactory _transportFactory;
 
@@ -108,7 +122,10 @@ class XmppClient {
   final String _resource = 'flutter-${Random().nextInt(1 << 32)}';
   final Map<String, Completer<XmlElement>> _pendingIq =
       <String, Completer<XmlElement>>{};
-  final Map<String, int> _mamRowCounts = <String, int>{};
+  final Map<String, List<ChatMessage>> _mamRows = <String, List<ChatMessage>>{};
+  final Set<String> _mamSilent = <String>{};
+  final Map<String, List<ParsedStanza>> _mamModifiers =
+      <String, List<ParsedStanza>>{};
   final Map<String, int> _privateStoreTimestamps = <String, int>{};
 
   XmppMessageCallback? onMessage;
@@ -116,9 +133,14 @@ class XmppClient {
   void Function(ParsedEdit edit)? onEdit;
   void Function(ParsedDelete delete)? onDelete;
   void Function(ParsedReaction reaction)? onReaction;
+  void Function(ParsedReceipt receipt)? onReceipt;
+  void Function(ParsedDisplayed displayed)? onDisplayed;
   XmppConnectionCallback? onConnectionChanged;
   void Function()? onReconnected;
   void Function(XmppAuthException error)? onAuthFailed;
+  void Function(ParsedEthoraEvent event)? onEthoraEvent;
+  void Function(ParsedMembership membership)? onMembership;
+  void Function(ParsedPresence presence)? onPresence;
 
   ChatConnectionState get state => _state;
   ChatConnectionState _state = ChatConnectionState.offline;
@@ -128,6 +150,12 @@ class XmppClient {
 
   String get username =>
       user.xmppUsername ?? user.walletAddress ?? user.username ?? '';
+
+  /// Replaces the SASL password used by the next [connect] (credential
+  /// recovery after `not-authorized`).
+  void updateXmppPassword(String password) {
+    user = user.copyWith(xmppPassword: password);
+  }
 
   String _nextId(String prefix) {
     _seq += 1;
@@ -253,6 +281,9 @@ class XmppClient {
         _handleIq(node);
       case 'message':
         _handleMessage(node);
+      case 'presence':
+        final presence = parsePresenceStanza(node);
+        if (presence != null) onPresence?.call(presence);
       default:
         break;
     }
@@ -350,13 +381,65 @@ class XmppClient {
     );
   }
 
+  /// Feature modules (calls, push) that need raw stanzas register here. Each
+  /// sees every incoming `<message>` before the chat pipeline; returning true
+  /// consumes it (the chat pipeline never sees it).
+  final List<bool Function(XmlElement message)> messageInterceptors =
+      <bool Function(XmlElement message)>[];
+
+  /// Sends a pre-built stanza. Returns false when the socket is not open.
+  bool sendStanza(String stanza) => _trySend(stanza);
+
+  /// Sends an IQ built by the caller and resolves with the result stanza
+  /// (an IQ error completes with an error). [id] must be the IQ's own id.
+  Future<XmlElement> sendIq(
+    String id,
+    String stanza, {
+    Duration timeout = const Duration(seconds: 10),
+  }) =>
+      _sendIq(id, stanza, timeout: timeout);
+
+  /// A unique stanza id: `prefix:ms:seq`.
+  String nextStanzaId(String prefix) => _nextId(prefix);
+
   void _handleMessage(XmlElement node) {
+    for (final interceptor
+        in List<bool Function(XmlElement message)>.of(messageInterceptors)) {
+      if (interceptor(node)) return;
+    }
+    final membership = parseMembershipStanza(node);
+    if (membership != null) onMembership?.call(membership);
+    final ethoraEvent = parseEthoraEventStanza(node);
+    if (ethoraEvent != null) {
+      onEthoraEvent?.call(ethoraEvent);
+      return;
+    }
     final parsed = parseMessageStanza(node);
     if (parsed == null) return;
+    // A silent window query keeps its edits, deletes and reactions for the
+    // caller; they must not reach the live list.
+    if (_mamSilent.isNotEmpty && parsed is! ParsedChatMessage) {
+      final silentId = childOf(node, 'result')?.getAttribute('queryid');
+      if (silentId != null && _mamSilent.contains(silentId)) {
+        if (parsed is ParsedEdit ||
+            parsed is ParsedDelete ||
+            parsed is ParsedReaction) {
+          _mamModifiers[silentId]?.add(parsed);
+        }
+        return;
+      }
+    }
     switch (parsed) {
       case ParsedChatMessage(:final message, :final queryId):
-        if (queryId != null && _mamRowCounts.containsKey(queryId)) {
-          _mamRowCounts[queryId] = _mamRowCounts[queryId]! + 1;
+        final rows = queryId == null ? null : _mamRows[queryId];
+        if (rows != null) {
+          rows.add(message);
+          // A silent window query keeps its rows for the caller and never
+          // writes them into the live list.
+          if (_mamSilent.contains(queryId)) return;
+        } else if (queryId != null && _mamSilent.contains(queryId)) {
+          // A late row of a timed-out window query: still not for the list.
+          return;
         }
         onMessage?.call(message);
       case ParsedEdit():
@@ -365,6 +448,10 @@ class XmppClient {
         onDelete?.call(parsed);
       case ParsedReaction():
         onReaction?.call(parsed);
+      case ParsedReceipt():
+        onReceipt?.call(parsed);
+      case ParsedDisplayed():
+        onDisplayed?.call(parsed);
       case ParsedTyping():
         onTyping?.call(parsed);
     }
@@ -387,43 +474,83 @@ class XmppClient {
     }
   }
 
-  /// One MAM page. [before] / [after] are archive ids. An IQ error is an
-  /// empty page (a fresh room answers with an error), like web.
+  /// One MAM page. [beforeId] / [afterId] are archive ids (exclusive). [start]
+  /// and [end] are ISO instants for a time-range query (web jump lookup). With
+  /// [deliver] false the rows are returned in [MamPage.messages] only. An IQ
+  /// error is an empty page (a fresh room answers with an error), like web.
   Future<MamPage> requestHistory({
     required String roomJid,
     int max = 30,
     String? beforeId,
     String? afterId,
+    String? start,
+    String? end,
+    bool deliver = true,
   }) async {
     final id = _nextId('get-history');
+    final timeRange = start != null || end != null;
     final cursor = afterId != null
         ? '<after>${xmlEscape(afterId)}</after>'
-        : beforeId == null
-            ? '<before/>'
-            : '<before>${xmlEscape(beforeId)}</before>';
-    _mamRowCounts[id] = 0;
+        : beforeId != null
+            ? '<before>${xmlEscape(beforeId)}</before>'
+            : timeRange
+                ? ''
+                : '<before/>';
+    final form = !timeRange
+        ? ''
+        : '<x xmlns="jabber:x:data" type="submit">'
+            '<field var="FORM_TYPE" type="hidden"><value>urn:xmpp:mam:2</value></field>'
+            '${start == null ? '' : '<field var="start"><value>${xmlEscape(start)}</value></field>'}'
+            '${end == null ? '' : '<field var="end"><value>${xmlEscape(end)}</value></field>'}'
+            '</x>';
+    var keepSilent = false;
+    _mamRows[id] = <ChatMessage>[];
+    if (!deliver) {
+      _mamSilent.add(id);
+      _mamModifiers[id] = <ParsedStanza>[];
+    }
     try {
       final iq = await _sendIq(
         id,
         '<iq type="set" to="${xmlEscape(roomJid)}" id="$id">'
-        '<query xmlns="urn:xmpp:mam:2" queryid="$id">'
+        '<query xmlns="urn:xmpp:mam:2" queryid="$id">$form'
         '<set xmlns="http://jabber.org/protocol/rsm"><max>$max</max>$cursor</set>'
         '</query></iq>',
       );
       final fin = childOf(iq, 'fin');
       final set = childOf(fin, 'set');
+      final rows = List<ChatMessage>.of(_mamRows[id] ?? const <ChatMessage>[]);
+      final first = childOf(set, 'first')?.innerText.trim();
+      final last = childOf(set, 'last')?.innerText.trim();
       return MamPage(
         complete: fin?.getAttribute('complete') == 'true',
-        first: childOf(set, 'first')?.innerText,
-        last: childOf(set, 'last')?.innerText,
-        count: _mamRowCounts[id] ?? 0,
+        first: first == null || first.isEmpty ? null : first,
+        last: last == null || last.isEmpty ? null : last,
+        count: rows.length,
+        messages: rows,
+        modifiers: List<ParsedStanza>.of(
+          _mamModifiers[id] ?? const <ParsedStanza>[],
+        ),
       );
     } on TimeoutException {
-      return MamPage(count: _mamRowCounts[id] ?? 0, timedOut: true);
+      keepSilent = !deliver;
+      final rows = List<ChatMessage>.of(_mamRows[id] ?? const <ChatMessage>[]);
+      return MamPage(count: rows.length, timedOut: true, messages: rows);
     } catch (_) {
-      return MamPage(count: _mamRowCounts[id] ?? 0, error: true);
+      final rows = List<ChatMessage>.of(_mamRows[id] ?? const <ChatMessage>[]);
+      return MamPage(count: rows.length, error: true, messages: rows);
     } finally {
-      _mamRowCounts.remove(id);
+      _mamRows.remove(id);
+      if (keepSilent) {
+        // The server may still be streaming this page: swallow its late rows.
+        Timer(const Duration(seconds: 15), () {
+          _mamSilent.remove(id);
+          _mamModifiers.remove(id);
+        });
+      } else {
+        _mamSilent.remove(id);
+        _mamModifiers.remove(id);
+      }
     }
   }
 
@@ -460,16 +587,23 @@ class XmppClient {
     );
   }
 
-  /// Media message like web sendMediaMessage. [file] is one entry of the
-  /// upload response `results`.
+  /// Media message like web sendMediaMessage. [files] is the upload
+  /// `results` in the order the user picked them; with no [files], [file]
+  /// is the one upload result. The flat fields describe files[0]; a message
+  /// with more than one file also carries the `attachments` JSON attribute.
+  /// A non-empty [caption] rides on <data> as `caption`.
   Future<void> sendMedia({
     required String roomJid,
     required String messageId,
     required String mediaUrl,
     required String mimeType,
     Map<String, dynamic> file = const <String, dynamic>{},
+    List<Map<String, dynamic>> files = const <Map<String, dynamic>>[],
+    String? caption,
   }) async {
-    String f(String key) => file[key]?.toString() ?? '';
+    final list = files.isEmpty ? <Map<String, dynamic>>[file] : files;
+    final head = list.first;
+    String f(String key) => head[key]?.toString() ?? '';
     final attrs = <String, String>{
       'senderJID': _boundJid ?? '',
       'senderFirstName': user.firstName ?? '',
@@ -482,7 +616,7 @@ class XmppClient {
       'isMediafile': 'true',
       'createdAt': f('createdAt'),
       'expiresAt': f('expiresAt'),
-      'fileName': file['filename']?.toString() ?? mediaUrl.split('/').last,
+      'fileName': head['filename']?.toString() ?? mediaUrl.split('/').last,
       'isVisible': f('isVisible'),
       'location': mediaUrl,
       'locationPreview': f('locationPreview'),
@@ -501,11 +635,100 @@ class XmppClient {
       'roomJid': roomJid,
       'push': 'true',
     };
+    if (list.length > 1) {
+      attrs['attachments'] = serializeAttachments(
+        list.map(attachmentFromUploadResult).toList(),
+      );
+    }
+    final trimmedCaption = caption?.trim() ?? '';
+    if (trimmedCaption.isNotEmpty) {
+      attrs['caption'] = trimmedCaption;
+    }
     final from = _boundJid == null ? '' : ' from="${xmlEscape(_boundJid!)}"';
     _sendRaw(
       '<message id="${xmlEscape(messageId)}" type="groupchat"$from to="${xmlEscape(roomJid)}">'
       '<body>media</body><store xmlns="urn:xmpp:hints"/>'
       '${_dataElement(attrs)}'
+      '</message>',
+    );
+  }
+
+  String get _fromAttr =>
+      _boundJid == null ? '' : ' from="${xmlEscape(_boundJid!)}"';
+
+  /// Reactions like web sendMessageReaction: [reactions] is the FULL new set
+  /// of my shortcodes on [messageId] (archive id), an empty list removes all.
+  Future<void> sendReaction({
+    required String roomJid,
+    required String messageId,
+    required List<String> reactions,
+  }) async {
+    final id = 'message-reaction:${DateTime.now().millisecondsSinceEpoch}';
+    final jid = xmlEscape(_boundJid ?? '');
+    _sendRaw(
+      '<message id="$id" type="groupchat"$_fromAttr to="${xmlEscape(roomJid)}">'
+      '<reactions id="${xmlEscape(messageId)}" from="$jid" xmlns="urn:xmpp:reactions:0">'
+      '${reactions.map((r) => '<reaction>${xmlEscape(r)}</reaction>').join()}'
+      '</reactions>'
+      '<data senderFirstName="${xmlEscape(user.firstName ?? '')}" senderLastName="${xmlEscape(user.lastName ?? '')}"/>'
+      '<store xmlns="urn:xmpp:hints"/>'
+      '</message>',
+    );
+  }
+
+  /// Edit like web editMessage: the new text is an attribute of `<replace>`.
+  Future<void> sendEdit({
+    required String roomJid,
+    required String messageId,
+    required String text,
+  }) async {
+    final id = 'edit-message-${DateTime.now().millisecondsSinceEpoch}';
+    _sendRaw(
+      '<message to="${xmlEscape(roomJid)}" type="groupchat" id="$id">'
+      '<replace id="${xmlEscape(messageId)}" text="${xmlEscape(text)}"/>'
+      '</message>',
+    );
+  }
+
+  /// Delete like web deleteMessage (fixed id and a dummy body).
+  Future<void> sendDelete({
+    required String roomJid,
+    required String messageId,
+  }) async {
+    _sendRaw(
+      '<message$_fromAttr to="${xmlEscape(roomJid)}" id="deleteMessageStanza" type="groupchat">'
+      '<body>wow</body>'
+      '<delete id="${xmlEscape(messageId)}"/>'
+      '</message>',
+    );
+  }
+
+  /// XEP-0184 delivery receipt broadcast to the room (web
+  /// sendReceivedReceipt). The real reader travels in `<received from>`.
+  void sendReceivedReceipt({
+    required String roomJid,
+    required String messageId,
+  }) {
+    final id = 'message-received:${DateTime.now().millisecondsSinceEpoch}';
+    _trySend(
+      '<message id="$id" type="groupchat"$_fromAttr to="${xmlEscape(roomJid)}">'
+      '<received xmlns="urn:xmpp:receipts" id="${xmlEscape(messageId)}" from="${xmlEscape(_boundJid ?? '')}"/>'
+      '<no-permanent-store xmlns="urn:xmpp:hints"/>'
+      '</message>',
+    );
+  }
+
+  /// XEP-0333 read marker broadcast to the room (web sendDisplayedMarker):
+  /// a single watermark, [messageId] is the newest displayed archive id.
+  void sendDisplayedMarker({
+    required String roomJid,
+    required String messageId,
+  }) {
+    final id = 'message-displayed:${DateTime.now().millisecondsSinceEpoch}';
+    _trySend(
+      '<message id="$id" type="groupchat"$_fromAttr to="${xmlEscape(roomJid)}">'
+      '<displayed xmlns="urn:xmpp:chat-markers:0" id="${xmlEscape(messageId)}" from="${xmlEscape(_boundJid ?? '')}"/>'
+      '<store xmlns="urn:xmpp:hints"/>'
       '</message>',
     );
   }
@@ -630,6 +853,66 @@ class XmppClient {
     await _closeTransport();
     _setState(ChatConnectionState.offline);
   }
+
+  /// Domain of this session (web sessionDomain): our own JID's domain, else
+  /// the configured XMPP host.
+  String get ownDomain {
+    final jid = _boundJid ?? '';
+    final at = jid.indexOf('@');
+    var domain = at >= 0 ? jid.substring(at + 1) : settings.host;
+    final slash = domain.indexOf('/');
+    if (slash >= 0) domain = domain.substring(0, slash);
+    return domain.isEmpty ? settings.host : domain;
+  }
+
+  /// Leaves a MUC for this session only (web leaveTheRoom): unavailable
+  /// presence to `room/<our local part>`.
+  void sendRoomLeave(String roomJid) {
+    _trySend(
+      '<presence to="${xmlEscape('$roomJid/$username')}" type="unavailable"/>',
+    );
+  }
+
+  /// Sets a room's picture on the XMPP side (web setRoomImage). The REST
+  /// picture is what survives a reload; this keeps the MUC's own profile in
+  /// step. An empty [thumbnail] clears it.
+  void sendRoomImage({
+    required String roomJid,
+    required String thumbnail,
+    String background = 'none',
+  }) {
+    _trySend(
+      buildRoomImageStanza(
+        roomJid: roomJid,
+        thumbnail: thumbnail,
+        background: background,
+      ),
+    );
+  }
+
+  /// Direct MUC invite (web inviteRoomRequest). [username] is the local part.
+  void sendRoomInvite({required String roomJid, required String username}) {
+    final id = 'invite-rooms:${DateTime.now().millisecondsSinceEpoch}';
+    _trySend(
+      '<message to="${xmlEscape(roomJid)}" id="$id">'
+      '<x xmlns="http://jabber.org/protocol/muc#user">'
+      '<invite to="${xmlEscape('$username@${settings.host}')}"/>'
+      '</x></message>',
+    );
+  }
+}
+
+/// The `ns:getrooms:setprofile` IQ of a room picture (web setRoomImage).
+String buildRoomImageStanza({
+  required String roomJid,
+  required String thumbnail,
+  String background = 'none',
+}) {
+  return '<iq id="setRoomImage" type="set">'
+      '<query xmlns="ns:getrooms:setprofile" '
+      'room_thumbnail="${xmlEscape(thumbnail)}" '
+      'room_background="${xmlEscape(background)}" '
+      'room="${xmlEscape(roomJid)}"/></iq>';
 }
 
 /// Parses the private store `chatjson` value (`{"room@conf": "1712..."}`).

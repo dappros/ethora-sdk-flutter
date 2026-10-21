@@ -56,6 +56,9 @@ class ChatComponentStore {
     await _secure.delete(key: _keyFileToken);
   }
 
+  Future<void> setFileToken(String fileToken) =>
+      _secure.write(key: _keyFileToken, value: fileToken);
+
   Future<String?> getToken() => _secure.read(key: _keyToken);
 
   Future<void> setToken(String token) =>

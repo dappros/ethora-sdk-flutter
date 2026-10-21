@@ -1,11 +1,22 @@
 import 'package:flutter/material.dart';
-import 'package:file_picker/file_picker.dart';
 
 import '../core/chat_component_controller.dart';
 import '../core/chat_component_state.dart';
+import '../i18n/chat_i18n.dart';
 import '../models/chat_component_config.dart';
-import '../models/chat_message.dart';
 import '../models/chat_room.dart';
+import '../theme/chat_theme.dart';
+import 'conversation/conversation_pane.dart';
+import '../networking/message_search_service.dart';
+import 'calls/call_header_buttons.dart';
+import 'calls/call_overlay_host.dart';
+import 'rooms/room_info_sheet.dart';
+import 'rooms/room_list_view.dart';
+import 'search/message_search_page.dart';
+import 'settings/chat_settings_screen.dart';
+
+/// Width from which the room list and the open chat sit side by side.
+const double kChatSplitBreakpoint = 720;
 
 class ChatComponent extends StatefulWidget {
   const ChatComponent({
@@ -25,10 +36,17 @@ class _ChatComponentState extends State<ChatComponent> {
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   final _jwtController = TextEditingController();
-  final _messageController = TextEditingController();
 
   bool _showJwtForm = false;
   bool _isLoggingIn = false;
+
+  /// Phone layout: the room list is a page of its own; false shows the chat.
+  bool _phoneShowsList = true;
+
+  ChatTheme? _theme;
+  ChatStrings? _strings;
+  String? _themeKey;
+  String? _stringsKey;
 
   @override
   void initState() {
@@ -43,57 +61,269 @@ class _ChatComponentState extends State<ChatComponent> {
     _emailController.dispose();
     _passwordController.dispose();
     _jwtController.dispose();
-    _messageController.dispose();
     super.dispose();
+  }
+
+  ChatTheme _resolveTheme(BuildContext context) {
+    final config = widget.config;
+    final platform = MediaQuery.platformBrightnessOf(context);
+    final key = '${config.colorScheme}|$platform|${identityHashCode(config.colors)}|'
+        '${identityHashCode(config.typography)}';
+    if (_theme == null || _themeKey != key) {
+      _theme = ChatTheme.from(
+        colors: config.colors,
+        typography: config.typography,
+        scheme: config.colorScheme ?? ChatColorScheme.light,
+        platformBrightness: platform,
+      );
+      _themeKey = key;
+    }
+    return _theme!;
+  }
+
+  ChatStrings _resolveStrings(ChatComponentState state) {
+    final locale = state.user?.appLanguage ?? widget.config.i18n?.locale;
+    final key = '$locale|${identityHashCode(widget.config.i18n?.strings)}';
+    if (_strings == null || _stringsKey != key) {
+      _strings = ChatStrings.resolve(locale, widget.config.i18n?.strings);
+      _stringsKey = key;
+    }
+    return _strings!;
   }
 
   @override
   Widget build(BuildContext context) {
+    final theme = _resolveTheme(context);
     return ValueListenableBuilder<ChatComponentState>(
       valueListenable: widget.controller.state,
       builder: (context, state, _) {
-        if (state.isLoading && !state.isInitialized) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        if (state.requiresLogin) {
-          return _LoginCard(
-            showJwtForm: _showJwtForm,
-            isLoggingIn: _isLoggingIn,
-            emailController: _emailController,
-            passwordController: _passwordController,
-            jwtController: _jwtController,
-            onModeChanged: (value) => setState(() => _showJwtForm = value),
-            onLoginEmail: () async {
-              setState(() => _isLoggingIn = true);
-              try {
-                await widget.controller.loginEmail(
-                  _emailController.text.trim(),
-                  _passwordController.text,
-                );
-              } finally {
-                if (mounted) setState(() => _isLoggingIn = false);
-              }
-            },
-            onLoginJwt: () async {
-              setState(() => _isLoggingIn = true);
-              try {
-                await widget.controller.loginJwt(_jwtController.text.trim());
-              } finally {
-                if (mounted) setState(() => _isLoggingIn = false);
-              }
-            },
-          );
-        }
-        if ((state.errorMessage ?? '').isNotEmpty && !state.isInitialized) {
-          return Center(child: Text(state.errorMessage!));
-        }
-        return _ChatLayout(
-          controller: widget.controller,
-          config: widget.config,
-          state: state,
-          messageController: _messageController,
+        final strings = _resolveStrings(state);
+        return Theme(
+          data: theme.toThemeData(),
+          child: ChatUiScope(
+            theme: theme,
+            strings: strings,
+            child: Builder(
+              builder: (context) => theme.scopeText(
+                context,
+                Material(
+                  color: theme.bg,
+                  child: CallOverlayHost(
+                    controller: widget.controller,
+                    config: widget.config,
+                    child: _buildBody(context, state, strings, theme),
+                  ),
+                ),
+              ),
+            ),
+          ),
         );
       },
+    );
+  }
+
+  Widget _buildBody(
+    BuildContext context,
+    ChatComponentState state,
+    ChatStrings strings,
+    ChatTheme theme,
+  ) {
+    if (state.isLoading && !state.isInitialized) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (state.requiresLogin) {
+      return _LoginCard(
+        showJwtForm: _showJwtForm,
+        isLoggingIn: _isLoggingIn,
+        emailController: _emailController,
+        passwordController: _passwordController,
+        jwtController: _jwtController,
+        onModeChanged: (value) => setState(() => _showJwtForm = value),
+        onLoginEmail: () => _login(
+          () => widget.controller.loginEmail(
+            _emailController.text.trim(),
+            _passwordController.text,
+          ),
+        ),
+        onLoginJwt: () => _login(
+          () => widget.controller.loginJwt(_jwtController.text.trim()),
+        ),
+      );
+    }
+    if ((state.errorMessage ?? '').isNotEmpty && !state.isInitialized) {
+      return Center(
+        child: Text(state.errorMessage!, style: TextStyle(color: theme.danger)),
+      );
+    }
+    return _buildChat(context, state);
+  }
+
+  Future<void> _login(Future<Object?> Function() action) async {
+    setState(() => _isLoggingIn = true);
+    try {
+      await action();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+          SnackBar(content: Text(_errorText(e))),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoggingIn = false);
+    }
+  }
+
+  String _errorText(Object error) {
+    final strings = ChatUiScope.of(context).strings;
+    final text = error.toString();
+    if (text.contains('401') || text.contains('403')) {
+      return strings.t('toast.invalidCredentials');
+    }
+    return strings.t('toast.loginErrorMessage');
+  }
+
+  ChatRoom? _selectedRoom(ChatComponentState state) {
+    if (state.rooms.isEmpty) return null;
+    if (state.selectedRoomJid == null) return state.rooms.first;
+    return state.rooms
+            .where((e) => e.jid == state.selectedRoomJid)
+            .firstOrNull ??
+        state.rooms.first;
+  }
+
+  Widget _buildChat(BuildContext context, ChatComponentState state) {
+    final config = widget.config;
+    final controller = widget.controller;
+    final theme = ChatUiScope.of(context).theme;
+    final room = _selectedRoom(state);
+    final roomListEnabled =
+        config.disableRooms != true && (config.roomJID ?? '').trim().isEmpty;
+    final wide = MediaQuery.sizeOf(context).width >= kChatSplitBreakpoint;
+
+    final jump = _jumpFor(state, room);
+
+    Widget conversation({VoidCallback? onBack}) => ConversationPane(
+          controller: controller,
+          config: config,
+          state: state,
+          room: room,
+          onBack: onBack,
+          jump: jump,
+          headerActions: _headerActions(context, room),
+          onTitleTap: room == null ||
+                  config.chatHeaderSettings?.chatInfoButtonDisabled == true ||
+                  config.disableRoomMenu == true
+              ? null
+              : () => showRoomInfo(
+                    context,
+                    controller: controller,
+                    config: config,
+                    roomJid: room.jid,
+                  ),
+          onQuoteTap: room == null
+              ? null
+              : (parentId) => controller.jumpToMessage(
+                    roomJid: room.jid,
+                    ids: <String>[parentId],
+                  ),
+        );
+
+    Widget list() => RoomListView(
+          controller: controller,
+          config: config,
+          selectedRoomJid: room?.jid,
+          onOpenSettings: () => showChatSettings(
+            context,
+            controller: controller,
+            config: config,
+          ),
+          onSelectRoom: (jid) {
+            controller.selectRoom(jid);
+            setState(() => _phoneShowsList = false);
+          },
+        );
+
+    if (wide && roomListEnabled) {
+      return Row(
+        children: [
+          SizedBox(width: 320, child: list()),
+          VerticalDivider(width: 1, color: theme.border),
+          Expanded(child: conversation()),
+        ],
+      );
+    }
+    if (roomListEnabled) {
+      if (_phoneShowsList) return list();
+      return conversation(
+        onBack: config.chatHeaderSettings?.backButtonDisabled == true
+            ? null
+            : () => setState(() => _phoneShowsList = true),
+      );
+    }
+    return conversation();
+  }
+
+  List<Widget> _headerActions(BuildContext context, ChatRoom? room) {
+    final ui = ChatUiScope.of(context);
+    final config = widget.config;
+    final controller = widget.controller;
+    return <Widget>[
+      if (room != null)
+        CallHeaderButtons(controller: controller, config: config, room: room),
+      if (room != null &&
+          isMessageSearchEnabled(config) &&
+          config.chatHeaderSettings?.hideSearch != true)
+        IconButton(
+          tooltip: ui.strings.t('search.messages.title'),
+          onPressed: () => showMessageSearch(
+            context,
+            controller: controller,
+            config: config,
+            roomJid: room.jid,
+            onOpenRoom: (_) => setState(() => _phoneShowsList = false),
+          ),
+          icon: Icon(Icons.search, color: ui.theme.icons),
+        ),
+      IconButton(
+        tooltip: ui.strings.t('settings.menu.title'),
+        onPressed: () => showChatSettings(
+          context,
+          controller: controller,
+          config: config,
+        ),
+        icon: Icon(Icons.settings_outlined, color: ui.theme.icons),
+      ),
+    ];
+  }
+
+  int _handledThreadJump = -1;
+
+  /// Maps the controller's jump state onto what the conversation shows: the
+  /// archive window instead of the live list, the target to scroll to, and
+  /// the thread to open for a thread-only reply.
+  ConversationJump _jumpFor(ChatComponentState state, ChatRoom? room) {
+    if (room == null) return const ConversationJump();
+    final window = state.jumpWindowByRoom[room.jid];
+    final target = state.jumpTarget;
+    final targetHere = target != null && target.roomJid == room.jid;
+    if (targetHere &&
+        target.threadRootId != null &&
+        _handledThreadJump != target.nonce) {
+      _handledThreadJump = target.nonce;
+      final root = target.threadRootId!;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) widget.controller.openThreadById(room.jid, root);
+      });
+    }
+    return ConversationJump(
+      messages: (window != null && window.isNotEmpty) ? window : null,
+      targetId: targetHere && target.threadRootId == null
+          ? target.messageId
+          : null,
+      nonce: targetHere ? target.nonce : 0,
+      onJumpToLatest: (window != null && window.isNotEmpty)
+          ? () => widget.controller.clearJumpWindow(room.jid)
+          : null,
     );
   }
 }
@@ -121,874 +351,91 @@ class _LoginCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final ui = ChatUiScope.of(context);
+    final strings = ui.strings;
     return Center(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 420),
-        child: Card(
-          margin: const EdgeInsets.all(16),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text(
-                  'Ethora Chat Login',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 12),
-                SegmentedButton<bool>(
-                  segments: const [
-                    ButtonSegment<bool>(value: false, label: Text('Email')),
-                    ButtonSegment<bool>(value: true, label: Text('JWT')),
-                  ],
-                  selected: <bool>{showJwtForm},
-                  onSelectionChanged: (values) => onModeChanged(values.first),
-                ),
-                const SizedBox(height: 16),
-                if (!showJwtForm) ...[
-                  TextField(
-                    controller: emailController,
-                    keyboardType: TextInputType.emailAddress,
-                    decoration: const InputDecoration(
-                      labelText: 'Email',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: passwordController,
-                    obscureText: true,
-                    decoration: const InputDecoration(
-                      labelText: 'Password',
-                      border: OutlineInputBorder(),
+      child: SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: Card(
+            margin: const EdgeInsets.all(16),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    strings.t('login.title'),
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w600,
+                      color: ui.theme.text,
                     ),
                   ),
                   const SizedBox(height: 12),
-                  FilledButton(
-                    onPressed: isLoggingIn ? null : onLoginEmail,
-                    child: Text(
-                      isLoggingIn ? 'Signing in...' : 'Login with Email',
-                    ),
+                  SegmentedButton<bool>(
+                    segments: [
+                      ButtonSegment<bool>(
+                        value: false,
+                        label: Text(strings.t('field.email')),
+                      ),
+                      ButtonSegment<bool>(
+                        value: true,
+                        label: Text(strings.t('login.tabJwt')),
+                      ),
+                    ],
+                    selected: <bool>{showJwtForm},
+                    onSelectionChanged: (values) => onModeChanged(values.first),
                   ),
-                ] else ...[
-                  TextField(
-                    controller: jwtController,
-                    minLines: 4,
-                    maxLines: 8,
-                    decoration: const InputDecoration(
-                      labelText: 'JWT token',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  FilledButton(
-                    onPressed: isLoggingIn ? null : onLoginJwt,
-                    child: Text(
-                      isLoggingIn ? 'Signing in...' : 'Login with JWT',
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _ChatLayout extends StatelessWidget {
-  const _ChatLayout({
-    required this.controller,
-    required this.config,
-    required this.state,
-    required this.messageController,
-  });
-
-  final ChatComponentController controller;
-  final ChatComponentConfig config;
-  final ChatComponentState state;
-  final TextEditingController messageController;
-
-  @override
-  Widget build(BuildContext context) {
-    final selectedRoom = _selectedRoom(state);
-    final messages = selectedRoom == null
-        ? const <ChatMessage>[]
-        : (state.messagesByRoom[selectedRoom.jid] ?? const <ChatMessage>[]);
-    final wide = MediaQuery.sizeOf(context).width >= 920;
-    final roomListEnabled =
-        config.disableRooms != true && (config.roomJID ?? '').trim().isEmpty;
-
-    if (wide && roomListEnabled) {
-      return Row(
-        children: [
-          SizedBox(
-            width: 320,
-            child: _RoomsPane(
-              state: state,
-              selectedRoomJid: selectedRoom?.jid,
-              onSelectRoom: controller.selectRoom,
-            ),
-          ),
-          const VerticalDivider(width: 1),
-          Expanded(
-            child: _ConversationPane(
-              config: config,
-              state: state,
-              room: selectedRoom,
-              messages: messages,
-              messageController: messageController,
-              isOwnMessage: controller.isOwnMessage,
-              onRetry: (msg) => controller.retryMessage(msg.roomJid, msg.id),
-              onLoadOlder: () =>
-                  controller.loadOlderMessages(selectedRoom?.jid ?? ''),
-              onSend: (text) =>
-                  controller.sendText(selectedRoom?.jid ?? '', text),
-              onPickAndSendFile: () async {
-                final room = selectedRoom;
-                if (room == null) return;
-                final picked = await FilePicker.platform.pickFiles(
-                  allowMultiple: false,
-                  withData: true,
-                );
-                final file = picked?.files.firstOrNull;
-                if (file == null || file.bytes == null) return;
-                await controller.sendMedia(
-                  room.jid,
-                  bytes: file.bytes!,
-                  filename: file.name,
-                  mimeType: file.extension == null
-                      ? 'application/octet-stream'
-                      : _mimeByExtension(file.extension!),
-                );
-              },
-              onTyping: (typing) {
-                final room = selectedRoom;
-                if (room != null) controller.setTyping(room.jid, typing);
-              },
-              onLogout: controller.logout,
-            ),
-          ),
-        ],
-      );
-    }
-
-    return Column(
-      children: [
-        if (roomListEnabled)
-          _CompactRoomSelector(
-            rooms: state.rooms,
-            selectedRoomJid: selectedRoom?.jid,
-            onSelectRoom: controller.selectRoom,
-          ),
-        Expanded(
-          child: _ConversationPane(
-            config: config,
-            state: state,
-            room: selectedRoom,
-            messages: messages,
-            messageController: messageController,
-            isOwnMessage: controller.isOwnMessage,
-            onRetry: (msg) => controller.retryMessage(msg.roomJid, msg.id),
-            onLoadOlder: () =>
-                controller.loadOlderMessages(selectedRoom?.jid ?? ''),
-            onSend: (text) =>
-                controller.sendText(selectedRoom?.jid ?? '', text),
-            onPickAndSendFile: () async {
-              final room = selectedRoom;
-              if (room == null) return;
-              final picked = await FilePicker.platform.pickFiles(
-                allowMultiple: false,
-                withData: true,
-              );
-              final file = picked?.files.firstOrNull;
-              if (file == null || file.bytes == null) return;
-              await controller.sendMedia(
-                room.jid,
-                bytes: file.bytes!,
-                filename: file.name,
-                mimeType: file.extension == null
-                    ? 'application/octet-stream'
-                    : _mimeByExtension(file.extension!),
-              );
-            },
-            onTyping: (typing) {
-              final room = selectedRoom;
-              if (room != null) controller.setTyping(room.jid, typing);
-            },
-            onLogout: controller.logout,
-          ),
-        ),
-      ],
-    );
-  }
-
-  ChatRoom? _selectedRoom(ChatComponentState state) {
-    if (state.rooms.isEmpty) return null;
-    if (state.selectedRoomJid == null) return state.rooms.first;
-    return state.rooms
-            .where((e) => e.jid == state.selectedRoomJid)
-            .firstOrNull ??
-        state.rooms.first;
-  }
-
-  String _mimeByExtension(String ext) {
-    final lower = ext.toLowerCase();
-    if (lower == 'jpg' || lower == 'jpeg') return 'image/jpeg';
-    if (lower == 'png') return 'image/png';
-    if (lower == 'gif') return 'image/gif';
-    if (lower == 'webp') return 'image/webp';
-    if (lower == 'heic') return 'image/heic';
-    if (lower == 'mp4') return 'video/mp4';
-    if (lower == 'mov') return 'video/quicktime';
-    if (lower == 'mp3') return 'audio/mpeg';
-    if (lower == 'm4a') return 'audio/mp4';
-    if (lower == 'aac') return 'audio/aac';
-    if (lower == 'wav') return 'audio/wav';
-    if (lower == 'pdf') return 'application/pdf';
-    return 'application/octet-stream';
-  }
-}
-
-class _RoomsPane extends StatelessWidget {
-  const _RoomsPane({
-    required this.state,
-    required this.selectedRoomJid,
-    required this.onSelectRoom,
-  });
-
-  final ChatComponentState state;
-  final String? selectedRoomJid;
-  final ValueChanged<String> onSelectRoom;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Container(
-          padding: const EdgeInsets.all(14),
-          alignment: Alignment.centerLeft,
-          child: const Text(
-            'Rooms',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-          ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: ListView.builder(
-            itemCount: state.rooms.length,
-            itemBuilder: (context, index) {
-              final room = state.rooms[index];
-              final isSelected = room.jid == selectedRoomJid;
-              return ListTile(
-                selected: isSelected,
-                title: Text(room.title ?? room.jid),
-                subtitle: room.composingList.isNotEmpty
-                    ? Text('${room.composingList.join(", ")} typing...')
-                    : Text(room.jid),
-                trailing: room.pendingMessages > 0
-                    ? _CountBadge(text: '${room.pendingMessages} sending')
-                    : room.unreadCount > 0
-                        ? _CountBadge(
-                            text: room.unreadCapped
-                                ? '${room.unreadCount}+'
-                                : '${room.unreadCount}',
-                          )
-                        : null,
-                onTap: () => onSelectRoom(room.jid),
-              );
-            },
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _CompactRoomSelector extends StatelessWidget {
-  const _CompactRoomSelector({
-    required this.rooms,
-    required this.selectedRoomJid,
-    required this.onSelectRoom,
-  });
-
-  final List<ChatRoom> rooms;
-  final String? selectedRoomJid;
-  final ValueChanged<String> onSelectRoom;
-
-  @override
-  Widget build(BuildContext context) {
-    final uniqueRoomsByJid = <String, ChatRoom>{};
-    for (final room in rooms) {
-      final jid = room.jid.trim();
-      if (jid.isEmpty) continue;
-      uniqueRoomsByJid.putIfAbsent(jid, () => room);
-    }
-    final effectiveRooms = uniqueRoomsByJid.values.toList();
-
-    if (effectiveRooms.isEmpty) {
-      return Container(
-        padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-        child: const InputDecorator(
-          decoration: InputDecoration(
-            border: OutlineInputBorder(),
-            labelText: 'Room',
-          ),
-          child: Text('No rooms available'),
-        ),
-      );
-    }
-
-    final roomJids = effectiveRooms.map((room) => room.jid).toSet();
-    final String effectiveValue =
-        (selectedRoomJid != null && roomJids.contains(selectedRoomJid))
-            ? selectedRoomJid!
-            : effectiveRooms.first.jid;
-
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-      child: DropdownButtonFormField<String>(
-        key: ValueKey<String>(effectiveValue),
-        initialValue: effectiveValue,
-        decoration: const InputDecoration(
-          border: OutlineInputBorder(),
-          labelText: 'Room',
-        ),
-        items: effectiveRooms
-            .map(
-              (room) => DropdownMenuItem<String>(
-                value: room.jid,
-                child: Text(
-                  room.title ?? room.jid,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            )
-            .toList(),
-        onChanged: (value) {
-          if (value != null) onSelectRoom(value);
-        },
-      ),
-    );
-  }
-}
-
-class _ConversationPane extends StatelessWidget {
-  const _ConversationPane({
-    required this.config,
-    required this.state,
-    required this.room,
-    required this.messages,
-    required this.messageController,
-    required this.isOwnMessage,
-    required this.onRetry,
-    required this.onLoadOlder,
-    required this.onSend,
-    required this.onPickAndSendFile,
-    required this.onTyping,
-    required this.onLogout,
-  });
-
-  final ChatComponentConfig config;
-  final ChatComponentState state;
-  final ChatRoom? room;
-  final List<ChatMessage> messages;
-  final TextEditingController messageController;
-  final bool Function(ChatMessage message) isOwnMessage;
-  final ValueChanged<ChatMessage> onRetry;
-  final Future<bool> Function() onLoadOlder;
-  final ValueChanged<String> onSend;
-  final Future<void> Function() onPickAndSendFile;
-  final ValueChanged<bool> onTyping;
-  final Future<void> Function() onLogout;
-
-  @override
-  Widget build(BuildContext context) {
-    final hasRoom = room != null;
-    final visible = messages
-        .where((m) => !m.isDeleted && (m.showInChannel || !m.isReply))
-        .toList();
-    final connectionColor = switch (state.connectionState) {
-      ChatConnectionState.online => Colors.green.shade600,
-      ChatConnectionState.connecting => Colors.orange.shade600,
-      ChatConnectionState.error => Colors.red.shade600,
-      ChatConnectionState.offline => Colors.grey.shade600,
-    };
-
-    return Column(
-      children: [
-        Container(
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
-          ),
-          child: Row(
-            children: [
-              IconButton(
-                tooltip: 'Attach file',
-                onPressed:
-                    config.disableMedia == true ? null : onPickAndSendFile,
-                icon: const Icon(Icons.attach_file_rounded),
-              ),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      room?.title ?? 'No room selected',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 18,
+                  const SizedBox(height: 16),
+                  if (!showJwtForm) ...[
+                    TextField(
+                      controller: emailController,
+                      keyboardType: TextInputType.emailAddress,
+                      decoration: InputDecoration(
+                        labelText: strings.t('field.email'),
                       ),
                     ),
-                    const SizedBox(height: 4),
-                    Row(
-                      children: [
-                        Container(
-                          width: 8,
-                          height: 8,
-                          decoration: BoxDecoration(
-                            color: connectionColor,
-                            shape: BoxShape.circle,
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          state.connectionState.name,
-                          style: TextStyle(
-                            color: Colors.grey.shade700,
-                            fontSize: 12,
-                            fontWeight: FontWeight.w500,
-                          ),
-                        ),
-                        if (room != null) ...[
-                          const SizedBox(width: 10),
-                          Text(
-                            room!.jid,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: Colors.grey.shade500,
-                              fontSize: 12,
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-              IconButton(
-                onPressed: onLogout,
-                icon: const Icon(Icons.logout),
-                tooltip: 'Logout',
-              ),
-            ],
-          ),
-        ),
-        if ((state.errorMessage ?? '').isNotEmpty)
-          Container(
-            width: double.infinity,
-            color: Colors.red.shade50,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: Text(
-              state.errorMessage!,
-              style: TextStyle(color: Colors.red.shade800),
-            ),
-          ),
-        Expanded(
-          child: Container(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [Colors.blueGrey.shade50, Colors.white],
-              ),
-            ),
-            child: hasRoom
-                ? (visible.isEmpty
-                    ? Center(
-                        child: Container(
-                          padding: const EdgeInsets.all(20),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.85),
-                            borderRadius: BorderRadius.circular(16),
-                            border: Border.all(color: Colors.grey.shade200),
-                          ),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(
-                                Icons.mark_chat_unread_outlined,
-                                color: Colors.blueGrey.shade400,
-                                size: 30,
-                              ),
-                              const SizedBox(height: 10),
-                              const Text(
-                                'No messages yet',
-                                style: TextStyle(fontWeight: FontWeight.w600),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                'Send your first message to start conversation',
-                                style: TextStyle(color: Colors.grey.shade600),
-                              ),
-                            ],
-                          ),
-                        ),
-                      )
-                    : NotificationListener<ScrollNotification>(
-                        onNotification: (notification) {
-                          // reversed list: maxScrollExtent is the oldest edge
-                          if (notification.metrics.pixels >=
-                                  notification.metrics.maxScrollExtent - 80 &&
-                              room?.historyComplete != true) {
-                            onLoadOlder();
-                          }
-                          return false;
-                        },
-                        child: ListView.builder(
-                          reverse: true,
-                          padding: const EdgeInsets.fromLTRB(14, 14, 14, 10),
-                          itemCount: visible.length,
-                          itemBuilder: (context, index) {
-                            final msg = visible[visible.length - 1 - index];
-                            if (msg.system) {
-                              return _SystemPill(text: msg.text);
-                            }
-                            return _MessageBubble(
-                              message: msg,
-                              isMine: isOwnMessage(msg),
-                              onRetry: () => onRetry(msg),
-                            );
-                          },
-                        ),
-                      ))
-                : const Center(child: Text('Select a room to start chatting')),
-          ),
-        ),
-        if (hasRoom && room!.composingList.isNotEmpty)
-          Align(
-            alignment: Alignment.centerLeft,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              child: Text(
-                '${room!.composingList.join(", ")} typing...',
-                style: TextStyle(
-                  fontStyle: FontStyle.italic,
-                  color: Colors.grey.shade700,
-                ),
-              ),
-            ),
-          ),
-        if (hasRoom)
-          SafeArea(
-            top: false,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-              child: Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: Colors.grey.shade200),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.04),
-                      blurRadius: 10,
-                      offset: const Offset(0, 3),
-                    ),
-                  ],
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: messageController,
-                        onChanged: (_) => onTyping(true),
-                        decoration: const InputDecoration(
-                          hintText: 'Write message...',
-                          border: InputBorder.none,
-                          isDense: true,
-                          contentPadding: EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 10,
-                          ),
-                        ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: passwordController,
+                      obscureText: true,
+                      decoration: InputDecoration(
+                        labelText: strings.t('field.password'),
                       ),
                     ),
+                    const SizedBox(height: 12),
                     FilledButton(
-                      onPressed: () {
-                        final text = messageController.text.trim();
-                        if (text.isEmpty) return;
-                        messageController.clear();
-                        onSend(text);
-                      },
-                      style: FilledButton.styleFrom(
-                        minimumSize: const Size(44, 44),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
+                      onPressed: isLoggingIn ? null : onLoginEmail,
+                      child: Text(
+                        isLoggingIn
+                            ? strings.t('login.signingIn')
+                            : strings.t('login.submitEmail'),
                       ),
-                      child: const Icon(Icons.send_rounded),
+                    ),
+                  ] else ...[
+                    TextField(
+                      controller: jwtController,
+                      minLines: 4,
+                      maxLines: 8,
+                      decoration: InputDecoration(
+                        labelText: strings.t('login.jwtField'),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    FilledButton(
+                      onPressed: isLoggingIn ? null : onLoginJwt,
+                      child: Text(
+                        isLoggingIn
+                            ? strings.t('login.signingIn')
+                            : strings.t('login.submitJwt'),
+                      ),
                     ),
                   ],
-                ),
+                ],
               ),
             ),
-          ),
-      ],
-    );
-  }
-}
-
-class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({
-    required this.message,
-    required this.isMine,
-    required this.onRetry,
-  });
-
-  final ChatMessage message;
-  final bool isMine;
-  final VoidCallback onRetry;
-
-  @override
-  Widget build(BuildContext context) {
-    final bg = isMine ? Colors.blue.shade600 : Colors.white;
-    final fg = isMine ? Colors.white : Colors.black87;
-    final time = _messageTime(message.createdAtMs);
-    final initials = _initials(message.user.displayName);
-    return Align(
-      alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 580),
-        child: Row(
-          mainAxisAlignment:
-              isMine ? MainAxisAlignment.end : MainAxisAlignment.start,
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            if (!isMine) ...[
-              CircleAvatar(
-                radius: 12,
-                backgroundColor: Colors.blueGrey.shade100,
-                child: Text(
-                  initials,
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: Colors.blueGrey.shade700,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-            ],
-            Flexible(
-              child: Container(
-                margin: const EdgeInsets.symmetric(vertical: 5),
-                padding: const EdgeInsets.fromLTRB(12, 9, 12, 8),
-                decoration: BoxDecoration(
-                  color: bg,
-                  borderRadius: BorderRadius.only(
-                    topLeft: const Radius.circular(14),
-                    topRight: const Radius.circular(14),
-                    bottomLeft: Radius.circular(isMine ? 14 : 4),
-                    bottomRight: Radius.circular(isMine ? 4 : 14),
-                  ),
-                  border: isMine
-                      ? null
-                      : Border.all(color: Colors.grey.shade200, width: 1),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(
-                        alpha: isMine ? 0.08 : 0.04,
-                      ),
-                      blurRadius: 8,
-                      offset: const Offset(0, 2),
-                    ),
-                  ],
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    if (!isMine)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 4),
-                        child: Text(
-                          message.user.displayName,
-                          style: TextStyle(
-                            color: Colors.blueGrey.shade700,
-                            fontWeight: FontWeight.w600,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ),
-                    Text(
-                      message.isMedia
-                          ? (message.data['caption'] ??
-                              message.data['originalName'] ??
-                              message.data['fileName'] ??
-                              'media')
-                          : message.text,
-                      style: TextStyle(color: fg),
-                    ),
-                    const SizedBox(height: 5),
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          time,
-                          style: TextStyle(
-                            fontSize: 10,
-                            color: isMine
-                                ? Colors.white.withValues(alpha: 0.78)
-                                : Colors.grey.shade500,
-                          ),
-                        ),
-                        if (message.isEdited) ...[
-                          const SizedBox(width: 6),
-                          Text(
-                            '(edited)',
-                            style: TextStyle(
-                              fontSize: 10,
-                              color: isMine
-                                  ? Colors.white.withValues(alpha: 0.78)
-                                  : Colors.grey.shade500,
-                            ),
-                          ),
-                        ],
-                        if (message.failed) ...[
-                          const SizedBox(width: 6),
-                          GestureDetector(
-                            onTap: onRetry,
-                            child: Text(
-                              'failed, tap to retry',
-                              style: TextStyle(
-                                fontSize: 10,
-                                color:
-                                    isMine ? Colors.white : Colors.red.shade700,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ),
-                        ],
-                        if (message.pending) ...[
-                          const SizedBox(width: 6),
-                          Text(
-                            'sending...',
-                            style: TextStyle(
-                              fontSize: 10,
-                              color: isMine
-                                  ? Colors.white.withValues(alpha: 0.78)
-                                  : Colors.orange.shade700,
-                              fontStyle: FontStyle.italic,
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            if (isMine) ...[
-              const SizedBox(width: 8),
-              CircleAvatar(
-                radius: 12,
-                backgroundColor: Colors.blue.shade100,
-                child: Text(
-                  initials,
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: Colors.blue.shade700,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  String _initials(String input) {
-    final parts = input
-        .trim()
-        .split(RegExp(r'\s+'))
-        .where((part) => part.isNotEmpty)
-        .toList();
-    if (parts.isEmpty) return '?';
-    if (parts.length == 1) {
-      return _firstChar(parts.first).toUpperCase();
-    }
-    return (_firstChar(parts.first) + _firstChar(parts.last)).toUpperCase();
-  }
-
-  String _firstChar(String value) {
-    if (value.isEmpty) return '';
-    return value.substring(0, 1);
-  }
-
-  String _messageTime(int timestampMs) {
-    final dt = DateTime.fromMillisecondsSinceEpoch(timestampMs);
-    final hh = dt.hour.toString().padLeft(2, '0');
-    final mm = dt.minute.toString().padLeft(2, '0');
-    return '$hh:$mm';
-  }
-}
-
-class _CountBadge extends StatelessWidget {
-  const _CountBadge({required this.text});
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: Colors.blue.shade50,
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(color: Colors.blue.shade800, fontSize: 12),
-      ),
-    );
-  }
-}
-
-extension _FirstOrNullExt<T> on Iterable<T> {
-  T? get firstOrNull => isEmpty ? null : first;
-}
-
-/// System messages and the "New Messages" delimiter render as a centered
-/// pill like web SystemMessage, never as a chat bubble.
-class _SystemPill extends StatelessWidget {
-  const _SystemPill({required this.text});
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Center(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-          decoration: BoxDecoration(
-            color: Colors.blueGrey.withValues(alpha: 0.12),
-            borderRadius: BorderRadius.circular(999),
-          ),
-          child: Text(
-            text,
-            style: TextStyle(fontSize: 12, color: Colors.blueGrey.shade700),
           ),
         ),
       ),

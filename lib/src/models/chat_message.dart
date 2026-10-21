@@ -44,6 +44,7 @@ class ChatMessage {
     this.reactions = const <String, ChatReaction>{},
     this.attachments = const <Map<String, String>>[],
     this.data = const <String, String>{},
+    this.receivedBy = const <String, int>{},
   });
 
   /// Archive id (MAM `<result id>` or `<stanza-id id>`), falling back to the
@@ -87,6 +88,10 @@ class ChatMessage {
   /// Every attribute of the `<data>` element, as received.
   final Map<String, String> data;
 
+  /// XEP-0184 delivery receipts: xmpp username -> ms when it was received.
+  /// Mirrors web `message.receivedBy`.
+  final Map<String, int> receivedBy;
+
   ChatMessage copyWith({
     String? id,
     String? roomJid,
@@ -112,6 +117,7 @@ class ChatMessage {
     Map<String, ChatReaction>? reactions,
     List<Map<String, String>>? attachments,
     Map<String, String>? data,
+    Map<String, int>? receivedBy,
   }) {
     return ChatMessage(
       id: id ?? this.id,
@@ -138,6 +144,7 @@ class ChatMessage {
       reactions: reactions ?? this.reactions,
       attachments: attachments ?? this.attachments,
       data: data ?? this.data,
+      receivedBy: receivedBy ?? this.receivedBy,
     );
   }
 }

@@ -13,6 +13,8 @@ class ChatUser {
     this.refreshToken,
     this.photoUrl,
     this.fileToken,
+    this.appLanguage,
+    this.chatLanguage,
   });
 
   final String? id;
@@ -30,6 +32,13 @@ class ChatUser {
 
   /// Token appended as `ft` to secure media URLs (login/refresh response).
   final String? fileToken;
+
+  /// Interface language of the account (BCP-47, e.g. "fr-CA"). Written by
+  /// `PUT /v1/users {appLanguage}`.
+  final String? appLanguage;
+
+  /// Language incoming messages are translated into (BCP-47).
+  final String? chatLanguage;
 
   String get displayName {
     final fromName = [
@@ -56,6 +65,8 @@ class ChatUser {
     String? refreshToken,
     String? photoUrl,
     String? fileToken,
+    String? appLanguage,
+    String? chatLanguage,
   }) {
     return ChatUser(
       id: id ?? this.id,
@@ -71,6 +82,8 @@ class ChatUser {
       refreshToken: refreshToken ?? this.refreshToken,
       photoUrl: photoUrl ?? this.photoUrl,
       fileToken: fileToken ?? this.fileToken,
+      appLanguage: appLanguage ?? this.appLanguage,
+      chatLanguage: chatLanguage ?? this.chatLanguage,
     );
   }
 
@@ -93,7 +106,14 @@ class ChatUser {
       refreshToken: json['refreshToken']?.toString(),
       photoUrl: user['profileImage']?.toString(),
       fileToken: json['fileToken']?.toString(),
+      appLanguage: _nonEmpty(user['appLanguage']),
+      chatLanguage: _nonEmpty(user['chatLanguage']),
     );
+  }
+
+  static String? _nonEmpty(Object? value) {
+    final text = value?.toString().trim();
+    return text == null || text.isEmpty ? null : text;
   }
 
   /// JSON without secrets (xmppPassword, token, refreshToken, fileToken).
@@ -122,6 +142,8 @@ class ChatUser {
       'refreshToken': refreshToken,
       'photoUrl': photoUrl,
       'fileToken': fileToken,
+      'appLanguage': appLanguage,
+      'chatLanguage': chatLanguage,
     };
   }
 
@@ -140,6 +162,8 @@ class ChatUser {
       refreshToken: json['refreshToken']?.toString(),
       photoUrl: json['photoUrl']?.toString(),
       fileToken: json['fileToken']?.toString(),
+      appLanguage: _nonEmpty(json['appLanguage']),
+      chatLanguage: _nonEmpty(json['chatLanguage']),
     );
   }
 }

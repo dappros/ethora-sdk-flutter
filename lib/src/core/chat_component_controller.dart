@@ -15,11 +15,43 @@ import 'history_queue_service.dart';
 import 'private_store_sync_service.dart';
 import 'send_queue_service.dart';
 import 'unread_service.dart';
+import '../models/media_attachment.dart';
 import '../networking/api_client.dart';
+import '../networking/auth_refresh.dart';
 import '../networking/auth_service.dart';
+import '../networking/media_upload_service.dart';
 import '../networking/rooms_service.dart';
 import '../networking/stanza_parser.dart';
+import '../networking/user_api.dart';
 import '../networking/xmpp_client.dart';
+import '../networking/xmpp_credentials.dart';
+import '../calls/call_log.dart';
+import '../calls/calls_coordinator.dart';
+import '../calls/calls_platform.dart';
+import '../models/video_calls_config.dart';
+import '../push/chat_push_coordinator.dart';
+import '../push/push_api.dart';
+import '../push/push_payload.dart';
+import '../push/push_registration.dart';
+import '../i18n/chat_i18n.dart';
+import 'message_reference.dart';
+import 'receipts.dart';
+import 'history_cursor.dart';
+import 'jump_window.dart';
+import 'message_search_session.dart';
+import 'room_events.dart';
+import '../networking/message_search_service.dart';
+import '../networking/room_actions_service.dart';
+import '../networking/files_service.dart';
+import 'my_files_model.dart';
+
+part 'controller_messaging.dart';
+part 'controller_jump.dart';
+part 'controller_rooms.dart';
+part 'controller_auth.dart';
+part 'controller_account.dart';
+part 'controller_push.dart';
+part 'controller_calls.dart';
 
 typedef XmppClientFactory = XmppClient Function({
   required XmppSettings settings,
@@ -34,10 +66,15 @@ class _PendingHeapItem {
     required this.messageId,
     required this.roomJid,
     required this.text,
+    this.isReply = false,
+    this.showInChannel = false,
+    this.mainMessage = '',
   })  : kind = _HeapKind.text,
         mediaUrl = null,
         mimeType = null,
-        file = null;
+        file = null,
+        files = const <Map<String, dynamic>>[],
+        caption = null;
 
   const _PendingHeapItem.media({
     required this.messageId,
@@ -45,16 +82,30 @@ class _PendingHeapItem {
     required this.mediaUrl,
     required this.mimeType,
     required this.file,
+    this.files = const <Map<String, dynamic>>[],
+    this.caption,
   })  : kind = _HeapKind.media,
-        text = null;
+        text = null,
+        isReply = false,
+        showInChannel = false,
+        mainMessage = '';
 
   final _HeapKind kind;
   final String messageId;
   final String roomJid;
   final String? text;
+
+  /// Thread reply fields of a text message (empty for a channel message).
+  final bool isReply;
+  final bool showInChannel;
+  final String mainMessage;
   final String? mediaUrl;
   final String? mimeType;
   final Map<String, dynamic>? file;
+
+  /// Every upload result of a multi-file message, in order (empty = [file]).
+  final List<Map<String, dynamic>> files;
+  final String? caption;
 }
 
 /// Pending text turns into "failed" after this long without a server echo
@@ -79,15 +130,14 @@ class ChatComponentController {
           config: config,
           readAccessToken: _store.getToken,
           readRefreshToken: _store.getRefreshToken,
-          writeTokens: (accessToken, refreshToken) async {
-            await _store.setToken(accessToken);
-            if (refreshToken != null && refreshToken.isNotEmpty) {
-              await _store.setRefreshToken(refreshToken);
-            }
-          },
+          writeTokens: _writeRotatedTokens,
+          writeFileToken: _onFileTokenRefreshed,
+          writeXmppPassword: _onXmppPasswordRefreshed,
+          hostRecovery: _attemptHostRecovery,
           clearSession: _onSessionExpired,
           log: _emitLog,
         );
+    _mediaUploads = MediaUploadService(apiClient: _apiClient, log: _emitLog);
     _authService = authService ??
         AuthService(apiClient: _apiClient, config: config, log: _emitLog);
     _roomsService = roomsService ??
@@ -113,7 +163,20 @@ class ChatComponentController {
       <String, Map<String, (String, Timer)>>{};
   final Set<String> _historyInFlight = <String>{};
 
+  /// Reactions whose target message is not loaded yet, applied on arrival:
+  /// room -> target archive id -> reactor -> reaction.
+  final Map<String, Map<String, Map<String, ChatReaction>>> _parkedReactions =
+      <String, Map<String, Map<String, ChatReaction>>>{};
+  DeliveryReceiptBatcher? _deliveryBatcher;
+  final Map<String, DisplayedMarkerThrottle> _displayedThrottles =
+      <String, DisplayedMarkerThrottle>{};
+  final Map<String, Timer> _markReadTimers = <String, Timer>{};
+  final Set<String> _threadHistoryInFlight = <String>{};
+  final _JumpRuntime _jump = _JumpRuntime();
+  final _RoomsRuntime _rooms = _RoomsRuntime();
+
   late final ApiClient _apiClient;
+  late final MediaUploadService _mediaUploads;
   late final AuthService _authService;
   late final RoomsService _roomsService;
   XmppClient? _xmpp;
@@ -121,6 +184,27 @@ class ChatComponentController {
   Timer? _typingStopTimer;
   Future<void>? _initializing;
   bool _disposed = false;
+
+  // Push, account and credential recovery (controller_push / _account / _auth).
+  late final ChatPushCoordinator _push = ChatPushCoordinator(
+    config: config,
+    apiClient: _apiClient,
+    state: state,
+    xmpp: () => _xmpp,
+    selectRoom: selectRoom,
+    log: (message) => _log(ChatLogLevel.info, ChatLogCategory.system, message),
+  );
+  // Audio/video calls (controller_calls).
+  late final CallsCoordinator _calls = createPlatformCallsCoordinator(
+    host: _ControllerCallsHost(this),
+    api: _apiClient,
+  );
+  late final UserApi _userApi = UserApi(_apiClient);
+  late final XmppCredentialRecovery _xmppCredentialRecovery =
+      _newXmppCredentialRecovery();
+  Future<void>? _xmppAuthRecovery;
+  int _xmppAuthRecoveryAttempts = 0;
+  Future<bool>? _hostRecoveryInFlight;
 
   final ValueNotifier<ChatComponentState> state =
       ValueNotifier<ChatComponentState>(const ChatComponentState());
@@ -225,6 +309,7 @@ class ChatComponentController {
       await _store.setRefreshToken(user.refreshToken!);
     }
     state.value = state.value.copyWith(user: user, requiresLogin: false);
+    unawaited(_apiClient.auth.scheduleProactive());
   }
 
   String get _myLocal {
@@ -283,6 +368,7 @@ class ChatComponentController {
     xmpp.onConnectionChanged = (connection) {
       state.value = state.value.copyWith(connectionState: connection);
       if (connection == ChatConnectionState.online) {
+        _xmppAuthRecoveryAttempts = 0;
         _sendQueue.resume();
         _historyQueue.resume();
       }
@@ -291,14 +377,19 @@ class ChatComponentController {
     xmpp.onAuthFailed = (error) {
       state.value = state.value.copyWith(errorMessage: error.toString());
       _log(ChatLogLevel.error, ChatLogCategory.xmpp, error.toString());
+      _xmppAuthRecovery = _recoverXmppAuth(xmpp);
     };
     xmpp.onMessage = _handleIncomingMessage;
     xmpp.onEdit = _handleEdit;
     xmpp.onDelete = _handleDelete;
     xmpp.onReaction = _handleReaction;
     xmpp.onTyping = _handleTyping;
+    _wireMessaging(xmpp);
+    _wireRoomEvents(xmpp);
+    _wireCalls(xmpp);
 
     await xmpp.connect();
+    await _awaitXmppAuthRecovery();
 
     final resolved = _configResolver.resolve(config);
     var rooms = await _roomsService.getRooms();
@@ -328,6 +419,9 @@ class ChatComponentController {
       globalLoading: false,
       isInitialized: true,
     );
+    unawaited(_push.onRuntimeReady().catchError((Object e) {
+      _log(ChatLogLevel.error, ChatLogCategory.system, 'Push setup failed: $e');
+    }));
   }
 
   List<String> _roomJids() => state.value.rooms
@@ -345,12 +439,15 @@ class ChatComponentController {
     await xmpp.sendPresenceToRooms(roomJids);
     final selected = state.value.selectedRoomJid;
     if (selected != null) {
-      await loadHistory(roomJid: selected, source: HistorySource.active);
+      final page =
+          await loadHistory(roomJid: selected, source: HistorySource.active);
+      _ackCatchUp(selected, page);
     }
     for (final jid in roomJids.where((jid) => jid != selected)) {
       unawaited(loadHistory(roomJid: jid, source: HistorySource.background));
     }
     await recoverPendingHeap();
+    unawaited(_push.onReconnected());
   }
 
   Future<void> selectRoom(String roomJid) async {
@@ -367,6 +464,7 @@ class ChatComponentController {
     );
     await markRoomViewed(normalized);
     _recalculateUnread();
+    _scheduleMarkRead(normalized);
   }
 
   String _newMessageId(String prefix) {
@@ -378,9 +476,19 @@ class ChatComponentController {
     return '$prefix-${DateTime.now().millisecondsSinceEpoch}-$suffix';
   }
 
-  Future<void> sendText(String roomJid, String text) async {
+  /// Sends a text message. With [mainMessage] (the parent JSON from
+  /// [createMainMessage]) it is a thread reply; [showInChannel] also posts it
+  /// to the room ("Also send to room").
+  Future<void> sendText(
+    String roomJid,
+    String text, {
+    String? mainMessage,
+    bool showInChannel = false,
+  }) async {
     final user = state.value.user;
     if (user == null || text.trim().isEmpty) return;
+    final isReply = (mainMessage ?? '').isNotEmpty;
+    if (!isReply) clearJumpWindow(roomJid);
     final messageId = _newMessageId('send-text-message');
     final now = DateTime.now().millisecondsSinceEpoch;
     final pending = ChatMessage(
@@ -392,18 +500,43 @@ class ChatComponentController {
       createdAtMs: now,
       timestamp: now,
       pending: true,
+      isReply: isReply,
+      showInChannel: !isReply || showInChannel,
+      mainMessage: isReply ? mainMessage : null,
+      langSource: _langSource,
     );
     _appendPendingMessage(pending);
     _pendingHeap.add(
-      _PendingHeapItem.text(messageId: messageId, roomJid: roomJid, text: text),
+      _PendingHeapItem.text(
+        messageId: messageId,
+        roomJid: roomJid,
+        text: text,
+        isReply: isReply,
+        showInChannel: showInChannel,
+        mainMessage: mainMessage ?? '',
+      ),
     );
     _setPendingSendState(messageId, roomJid);
     _armWatchdog(messageId, roomJid, kTextPendingWatchdog);
     promoteRoomHistory(roomJid);
-    _enqueueText(messageId, roomJid, text);
+    _enqueueText(
+      messageId,
+      roomJid,
+      text,
+      isReply: isReply,
+      showInChannel: showInChannel,
+      mainMessage: mainMessage ?? '',
+    );
   }
 
-  void _enqueueText(String messageId, String roomJid, String text) {
+  void _enqueueText(
+    String messageId,
+    String roomJid,
+    String text, {
+    bool isReply = false,
+    bool showInChannel = false,
+    String mainMessage = '',
+  }) {
     unawaited(_sendQueue.enqueue(
       id: messageId,
       roomJid: roomJid,
@@ -414,6 +547,10 @@ class ChatComponentController {
           roomJid: roomJid,
           messageId: messageId,
           text: text,
+          isReply: isReply,
+          showInChannel: showInChannel,
+          mainMessage: mainMessage,
+          langSource: _langSource ?? 'en',
         );
         return true;
       },
@@ -425,59 +562,13 @@ class ChatComponentController {
     required List<int> bytes,
     required String filename,
     required String mimeType,
-  }) async {
-    if (config.disableMedia == true) {
-      return;
-    }
-    final user = state.value.user;
-    if (user == null) return;
-
-    final uploadResponse = await _apiClient.upload(
-      '/files/',
-      bytes: bytes,
-      filename: filename,
-      mimeType: mimeType,
+  }) {
+    return sendMediaFiles(
+      roomJid,
+      files: <MediaFileInput>[
+        MediaFileInput(bytes: bytes, filename: filename, mimeType: mimeType),
+      ],
     );
-    final results =
-        (uploadResponse['data'] as Map<String, dynamic>?)?['results'] as List?;
-    final fileData = (results?.isNotEmpty == true
-            ? results!.first as Map<String, dynamic>
-            : null) ??
-        <String, dynamic>{};
-    final mediaUrl = fileData['location']?.toString() ?? '';
-    if (mediaUrl.isEmpty) {
-      throw Exception('Media upload returned empty location');
-    }
-
-    final messageId = _newMessageId('send-media-message');
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final pending = ChatMessage(
-      id: messageId,
-      xmppId: messageId,
-      roomJid: roomJid,
-      text: 'media',
-      user: user,
-      createdAtMs: now,
-      timestamp: now,
-      pending: true,
-      isMedia: true,
-      mediaUrl: mediaUrl,
-      mimeType: mimeType,
-    );
-    _appendPendingMessage(pending);
-    _pendingHeap.add(
-      _PendingHeapItem.media(
-        messageId: messageId,
-        roomJid: roomJid,
-        mediaUrl: mediaUrl,
-        mimeType: mimeType,
-        file: fileData,
-      ),
-    );
-    _setPendingSendState(messageId, roomJid);
-    _armWatchdog(messageId, roomJid, kMediaPendingWatchdog);
-    promoteRoomHistory(roomJid);
-    _enqueueMedia(messageId, roomJid, mediaUrl, mimeType, fileData);
   }
 
   void _enqueueMedia(
@@ -485,8 +576,10 @@ class ChatComponentController {
     String roomJid,
     String mediaUrl,
     String mimeType,
-    Map<String, dynamic> file,
-  ) {
+    Map<String, dynamic> file, {
+    List<Map<String, dynamic>> files = const <Map<String, dynamic>>[],
+    String? caption,
+  }) {
     unawaited(_sendQueue.enqueue(
       id: messageId,
       roomJid: roomJid,
@@ -499,6 +592,8 @@ class ChatComponentController {
           mediaUrl: mediaUrl,
           mimeType: mimeType,
           file: file,
+          files: files,
+          caption: caption,
         );
         return true;
       },
@@ -522,7 +617,14 @@ class ChatComponentController {
           : kMediaPendingWatchdog,
     );
     if (item.kind == _HeapKind.text) {
-      _enqueueText(messageId, roomJid, item.text ?? '');
+      _enqueueText(
+        messageId,
+        roomJid,
+        item.text ?? '',
+        isReply: item.isReply,
+        showInChannel: item.showInChannel,
+        mainMessage: item.mainMessage,
+      );
     } else {
       _enqueueMedia(
         messageId,
@@ -530,6 +632,8 @@ class ChatComponentController {
         item.mediaUrl ?? '',
         item.mimeType ?? 'application/octet-stream',
         item.file ?? const <String, dynamic>{},
+        files: item.files,
+        caption: item.caption,
       );
     }
   }
@@ -565,6 +669,7 @@ class ChatComponentController {
     HistorySource source = HistorySource.normal,
   }) async {
     final epoch = _roomEpoch[roomJid] ?? 0;
+    final hadMessages = _roomHasArchivedMessages(roomJid);
     var page = const MamPage();
     final task = HistoryTask(
       id: 'history-${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(99999)}',
@@ -584,9 +689,12 @@ class ChatComponentController {
       completer: Completer<void>(),
     );
     await _historyQueue.enqueue(task);
-    if (beforeId != null && page.complete) {
-      _updateRoom(roomJid, (room) => room.copyWith(historyComplete: true));
-    }
+    _applyHistoryPage(
+      roomJid,
+      page,
+      beforeId: beforeId,
+      hadMessages: hadMessages,
+    );
     return page;
   }
 
@@ -598,18 +706,9 @@ class ChatComponentController {
     if (room?.historyComplete == true) return false;
     if (!_historyInFlight.add(roomJid)) return false;
     try {
-      final oldest =
-          (state.value.messagesByRoom[roomJid] ?? const <ChatMessage>[])
-              .where((m) => !m.pending && !m.system && m.id != 'delimiter-new')
-              .map((m) => m.id)
-              .where((id) => RegExp(r'^\d+$').hasMatch(id))
-              .fold<String?>(null, (min, id) {
-        if (min == null) return id;
-        return (BigInt.tryParse(id) ?? BigInt.zero) <
-                (BigInt.tryParse(min) ?? BigInt.zero)
-            ? id
-            : min;
-      });
+      // The server's own cursor (older of it and the oldest loaded row), so a
+      // page made only of reactions or receipts does not stall paging.
+      final oldest = _olderAnchor(roomJid);
       final page = await loadHistory(
         roomJid: roomJid,
         max: max,
@@ -618,6 +717,14 @@ class ChatComponentController {
       );
       if (oldest == null && page.complete) {
         _updateRoom(roomJid, (r) => r.copyWith(historyComplete: true));
+      }
+      // A page that does not move the cursor would be asked for again forever.
+      if (!page.complete &&
+          !page.error &&
+          !page.timedOut &&
+          oldest != null &&
+          !historyPageProgressed(anchor: oldest, first: page.first)) {
+        return false;
       }
       return !page.complete && !page.error;
     } finally {
@@ -648,7 +755,9 @@ class ChatComponentController {
       messagesByRoom: map,
       rooms: updatedRooms,
     );
-    await _privateStoreSync.write(_xmpp, roomJid: roomJid, timestamp: ts);
+    if (config.disableLastRead != true) {
+      await _privateStoreSync.write(_xmpp, roomJid: roomJid, timestamp: ts);
+    }
   }
 
   void promoteRoomHistory(String roomJid) {
@@ -675,7 +784,14 @@ class ChatComponentController {
     final snapshot = List<_PendingHeapItem>.from(_pendingHeap);
     for (final item in snapshot) {
       if (item.kind == _HeapKind.text) {
-        _enqueueText(item.messageId, item.roomJid, item.text ?? '');
+        _enqueueText(
+          item.messageId,
+          item.roomJid,
+          item.text ?? '',
+          isReply: item.isReply,
+          showInChannel: item.showInChannel,
+          mainMessage: item.mainMessage,
+        );
       } else {
         _enqueueMedia(
           item.messageId,
@@ -683,27 +799,22 @@ class ChatComponentController {
           item.mediaUrl ?? '',
           item.mimeType ?? 'application/octet-stream',
           item.file ?? const <String, dynamic>{},
+          files: item.files,
+          caption: item.caption,
         );
       }
     }
   }
 
-  Future<void> logout() async {
-    _typingStopTimer?.cancel();
-    await _xmpp?.disconnect();
-    _xmpp = null;
-    _resetRuntimeState();
-    await _store.clearSession();
-    state.value = const ChatComponentState(
-      isInitialized: false,
-      requiresLogin: true,
-      connectionState: ChatConnectionState.offline,
-    );
-  }
+  /// Signs out in web order (see [ChatControllerAccount]): push release in
+  /// parallel with the read marker flush, XMPP disconnect, stored session
+  /// cleared, `config.logout` hooks around it.
+  Future<void> logout() => _runLogout();
 
   /// Called by [ApiClient] when a token refresh failed for good: the
   /// session is gone, so the UI must show the login state.
   Future<void> _onSessionExpired() async {
+    _apiClient.auth.stopProactive();
     await _store.clearSession();
     if (_disposed) return;
     await _xmpp?.disconnect();
@@ -732,6 +843,10 @@ class ChatComponentController {
     }
     _typers.clear();
     _historyInFlight.clear();
+    _disposeMessagingRuntime();
+    _disposeJumpRuntime();
+    _disposeRoomsRuntime();
+    _disposeCallsRuntime();
   }
 
   void _appendPendingMessage(ChatMessage message) {
@@ -781,6 +896,13 @@ class ChatComponentController {
       ...(map[incoming.roomJid] ?? <ChatMessage>[]),
     ];
 
+    // The same call logged twice (this device's fallback entry and the
+    // server's): keep one, the longer (web addRoomMessage callLog.callId).
+    final callLogAt = callLogIndexFor(roomMessages, incoming);
+    if (callLogAt >= 0 && roomMessages[callLogAt].id != incoming.id) {
+      incoming = mergeCallLog(roomMessages.removeAt(callLogAt), incoming);
+    }
+
     // The echo of our own send carries our outer id as xmppId.
     final pendingIndex = incoming.xmppId == null
         ? -1
@@ -816,6 +938,7 @@ class ChatComponentController {
       }
     }
     roomMessages.sort((a, b) => a.createdAtMs.compareTo(b.createdAtMs));
+    _applyParkedReactions(incoming.roomJid, roomMessages);
 
     final targetRoom = state.value.rooms.firstWhere(
       (room) => room.jid == incoming.roomJid,
@@ -831,6 +954,7 @@ class ChatComponentController {
     if (acked != null) {
       unawaited(_deliverOnMessageSent(acked));
     }
+    _afterIncomingMessage(incoming, wasOwnEcho: acked != null);
   }
 
   void _handleEdit(ParsedEdit edit) {
@@ -852,14 +976,18 @@ class ChatComponentController {
   }
 
   void _handleReaction(ParsedReaction event) {
+    final loaded = state.value.messagesByRoom[event.roomJid];
+    final known = loaded?.any(
+          (m) => m.id == event.targetId || m.xmppId == event.targetId,
+        ) ??
+        false;
+    if (!known) {
+      _parkReaction(event);
+      return;
+    }
     _updateMessage(event.roomJid, event.targetId, (m) {
       final current = m.reactions[event.reactor];
-      final currentTs = timestampFromUnknown(current?.ts);
-      final nextTs = timestampFromUnknown(event.reaction.ts);
-      if (current != null &&
-          currentTs > 0 &&
-          nextTs > 0 &&
-          nextTs < currentTs) {
+      if (current != null && compareReactionTs(event.reaction.ts, current.ts) < 0) {
         return m;
       }
       return m.copyWith(
@@ -979,9 +1107,113 @@ class ChatComponentController {
   void dispose() {
     _disposed = true;
     _typingStopTimer?.cancel();
+    _apiClient.auth.stopProactive();
+    _push.dispose();
     _xmpp?.disconnect();
     _resetRuntimeState();
     _logController.close();
     state.dispose();
+  }
+
+  /// Sends ONE message carrying every file in [files], in pick order, like
+  /// web sendMedia. Files upload [kMediaUploadConcurrency] at a time; the
+  /// stanza goes out only once all of them are up, so a failed upload throws
+  /// and nothing is sent. [caption] rides on the same message.
+  Future<void> sendMediaFiles(
+    String roomJid, {
+    required List<MediaFileInput> files,
+    String? caption,
+  }) async {
+    if (config.disableMedia == true || files.isEmpty) {
+      return;
+    }
+    final user = state.value.user;
+    if (user == null) return;
+
+    final picked = files.take(kMaxAttachmentsPerMessage).toList();
+    final results = List<Map<String, dynamic>>.filled(
+      picked.length,
+      const <String, dynamic>{},
+    );
+    for (var start = 0; start < picked.length; start += kMediaUploadConcurrency) {
+      final end = min(start + kMediaUploadConcurrency, picked.length);
+      await Future.wait(<Future<void>>[
+        for (var i = start; i < end; i++)
+          _mediaUploads
+              .uploadFile(
+                roomJid: roomJid,
+                bytes: picked[i].bytes,
+                filename: picked[i].filename,
+                mimeType: picked[i].mimeType,
+              )
+              .then((raw) {
+                results[i] = raw;
+              }),
+      ]);
+    }
+
+    final head = results.first;
+    final mediaUrl = head['location']?.toString() ?? '';
+    if (mediaUrl.isEmpty) {
+      throw Exception('Media upload returned empty location');
+    }
+    final mimeType = picked.first.mimeType;
+    final trimmedCaption = caption?.trim() ?? '';
+
+    final messageId = _newMessageId('send-media-message');
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final pending = ChatMessage(
+      id: messageId,
+      xmppId: messageId,
+      roomJid: roomJid,
+      text: 'media',
+      user: user,
+      createdAtMs: now,
+      timestamp: now,
+      pending: true,
+      isMedia: true,
+      mediaUrl: mediaUrl,
+      mimeType: mimeType,
+      attachments: results.map(attachmentFromUploadResult).toList(),
+      data: <String, String>{
+        if (trimmedCaption.isNotEmpty) 'caption': trimmedCaption,
+      },
+    );
+    _appendPendingMessage(pending);
+    _pendingHeap.add(
+      _PendingHeapItem.media(
+        messageId: messageId,
+        roomJid: roomJid,
+        mediaUrl: mediaUrl,
+        mimeType: mimeType,
+        file: head,
+        files: results,
+        caption: trimmedCaption.isEmpty ? null : trimmedCaption,
+      ),
+    );
+    _setPendingSendState(messageId, roomJid);
+    _armWatchdog(messageId, roomJid, kMediaPendingWatchdog);
+    promoteRoomHistory(roomJid);
+    _enqueueMedia(
+      messageId,
+      roomJid,
+      mediaUrl,
+      mimeType,
+      head,
+      files: results,
+      caption: trimmedCaption.isEmpty ? null : trimmedCaption,
+    );
+  }
+
+  /// A refresh response carried a new `fileToken`: keep it in secure storage
+  /// and in the session user, so secure media re-renders with the fresh `ft`.
+  Future<void> _onFileTokenRefreshed(String fileToken) async {
+    await _store.setFileToken(fileToken);
+    if (_disposed) return;
+    final current = state.value.user;
+    if (current == null) return;
+    state.value = state.value.copyWith(
+      user: current.copyWith(fileToken: fileToken),
+    );
   }
 }

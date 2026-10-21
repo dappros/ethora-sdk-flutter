@@ -67,8 +67,37 @@ class ParsedTyping extends ParsedStanza {
   final String? senderJid;
 }
 
+/// XEP-0184 delivery receipt (`message-received:` stanza, web
+/// onReceivedReceipt). The reader is the `<received from>` localpart because
+/// the MUC rewrites the outer `from`.
+class ParsedReceipt extends ParsedStanza {
+  const ParsedReceipt({
+    required this.roomJid,
+    required this.messageId,
+    required this.fromXmppUsername,
+  });
+  final String roomJid;
+  final String messageId;
+  final String fromXmppUsername;
+}
+
+/// XEP-0333 read marker (`message-displayed:` stanza, web onDisplayedMarker).
+/// It is a room-level watermark, not a per-message flag.
+class ParsedDisplayed extends ParsedStanza {
+  const ParsedDisplayed({
+    required this.roomJid,
+    required this.messageId,
+    required this.xmppUsername,
+  });
+  final String roomJid;
+  final String messageId;
+  final String xmppUsername;
+}
+
 const _nsMam = 'urn:xmpp:mam:2';
 const _nsChatStates = 'http://jabber.org/protocol/chatstates';
+const _nsReceipts = 'urn:xmpp:receipts';
+const _nsChatMarkers = 'urn:xmpp:chat-markers:0';
 
 /// Converts any id-like or date-like value to epoch milliseconds the way web
 /// `getTimestampFromUnknown` does (seconds, ms, microseconds, ISO strings).
@@ -145,6 +174,32 @@ ParsedStanza? parseMessageStanza(XmlElement stanza) {
   final archiveId = result?.getAttribute('id') ?? stanzaIdValue ?? xmppId;
   final data = childOf(full, 'data') ?? childOf(stanza, 'data');
 
+  // Receipts and read markers are live only: web ignores them in MAM.
+  if (result == null) {
+    final received = childOf(full, 'received', xmlns: _nsReceipts);
+    if (received != null && (xmppId ?? '').contains('message-received')) {
+      final messageId = received.getAttribute('id') ?? '';
+      final reader = localPart(received.getAttribute('from'));
+      if (messageId.isEmpty || reader.isEmpty) return null;
+      return ParsedReceipt(
+        roomJid: roomJid,
+        messageId: messageId,
+        fromXmppUsername: reader,
+      );
+    }
+    final displayed = childOf(full, 'displayed', xmlns: _nsChatMarkers);
+    if (displayed != null && (xmppId ?? '').contains('message-displayed')) {
+      final messageId = displayed.getAttribute('id') ?? '';
+      final reader = localPart(displayed.getAttribute('from'));
+      if (messageId.isEmpty || reader.isEmpty) return null;
+      return ParsedDisplayed(
+        roomJid: roomJid,
+        messageId: messageId,
+        xmppUsername: reader,
+      );
+    }
+  }
+
   // Call signalling never reaches the chat list (web dispatchStanza).
   final dataType = data?.getAttribute('type') ?? '';
   if (dataType.startsWith('call-') &&
@@ -220,8 +275,9 @@ ParsedStanza? parseMessageStanza(XmlElement stanza) {
       if (a.name.local != 'xmlns') a.name.local: a.value,
   };
 
-  final delay =
-      childOf(full, 'delay') ?? childOf(full, 'x', xmlns: 'jabber:x:delay');
+  final delay = childOf(forwarded, 'delay') ??
+      childOf(full, 'delay') ??
+      childOf(full, 'x', xmlns: 'jabber:x:delay');
   var ts = timestampFromUnknown(delay?.getAttribute('stamp'));
   if (ts == 0) ts = timestampFromUnknown(stanzaIdValue);
   if (ts == 0) ts = timestampFromUnknown(xmppId);
@@ -325,4 +381,146 @@ String xmlEscape(String input) {
       .replaceAll('>', '&gt;')
       .replaceAll('"', '&quot;')
       .replaceAll("'", '&apos;');
+}
+
+// --- Server push: <ethora-event>, MUC membership, occupant presence -----------
+//
+// These are not chat messages, so they are plain classes (not ParsedStanza
+// subtypes) and the controller acts on them through their own callbacks.
+
+const _nsMucUser = 'http://jabber.org/protocol/muc#user';
+const _nsEthoraEvents = 'urn:ethora:events:1';
+
+/// `<ethora-event>` inside a `type="headline"` message from the server admin
+/// (web ethoraEvents.ts). The payload is a pointer only: the client re-reads
+/// the room through the REST API, so attributes are never shown or stored.
+class ParsedEthoraEvent {
+  const ParsedEthoraEvent({
+    required this.from,
+    required this.type,
+    required this.attributes,
+  });
+
+  /// Raw `from` of the carrier message (must be a bare server JID to trust).
+  final String from;
+  final String type;
+  final Map<String, String> attributes;
+}
+
+/// Server message about a room membership change: `x muc#user` with an `item jid
+/// affiliation` without an invite (web onRoomMembershipChange).
+class ParsedMembership {
+  const ParsedMembership({
+    required this.roomJid,
+    required this.affiliation,
+    required this.xmppUsername,
+  });
+
+  final String roomJid;
+  final String affiliation;
+  final String xmppUsername;
+}
+
+/// Occupant presence in a MUC (`from="room/nick"`).
+class ParsedPresence {
+  const ParsedPresence({
+    required this.roomJid,
+    required this.nick,
+    required this.unavailable,
+    required this.statusCodes,
+    required this.affiliation,
+    this.jid,
+  });
+
+  final String roomJid;
+  final String nick;
+  final bool unavailable;
+  final Set<String> statusCodes;
+  final String affiliation;
+  final String? jid;
+
+  /// Removed by the room owner: status 110 (self) and 321 (kicked), web
+  /// onRoomKicked.
+  bool get isKicked =>
+      unavailable &&
+      statusCodes.contains('110') &&
+      statusCodes.contains('321');
+}
+
+/// Parses an `<ethora-event>` carried by the stanza itself or by a MUC-SUB
+/// wrapper. Returns null for every other message.
+ParsedEthoraEvent? parseEthoraEventStanza(XmlElement stanza) {
+  for (final carrier in <XmlElement>[stanza, unwrapMucSub(stanza)]) {
+    if (carrier.getAttribute('type') != 'headline') continue;
+    final event = childOf(carrier, 'ethora-event', xmlns: _nsEthoraEvents);
+    if (event == null) continue;
+    return ParsedEthoraEvent(
+      from: carrier.getAttribute('from') ?? '',
+      type: event.getAttribute('type') ?? '',
+      attributes: <String, String>{
+        for (final a in event.attributes)
+          if (a.name.local != 'xmlns') a.name.local: a.value,
+      },
+    );
+  }
+  return null;
+}
+
+ParsedMembership? parseMembershipStanza(XmlElement stanza) {
+  if (stanza.name.local != 'message') return null;
+  if (stanza.getAttribute('type') == 'error') return null;
+  final roomJid = (stanza.getAttribute('from') ?? '').split('/').first;
+  if (roomJid.isEmpty) return null;
+  final x = childOf(stanza, 'x', xmlns: _nsMucUser);
+  if (x == null || childOf(x, 'invite') != null) return null;
+  final item = childOf(x, 'item');
+  final memberJid = item?.getAttribute('jid') ?? '';
+  if (item == null || memberJid.isEmpty) return null;
+  return ParsedMembership(
+    roomJid: roomJid,
+    affiliation: item.getAttribute('affiliation') ?? '',
+    xmppUsername: localPart(memberJid),
+  );
+}
+
+ParsedPresence? parsePresenceStanza(XmlElement stanza) {
+  final from = stanza.getAttribute('from') ?? '';
+  final slash = from.indexOf('/');
+  if (slash <= 0) return null;
+  final x = childOf(stanza, 'x', xmlns: _nsMucUser);
+  final codes = <String>{
+    for (final s in x?.childElements ?? const <XmlElement>[])
+      if (s.name.local == 'status' && s.getAttribute('code') != null)
+        s.getAttribute('code')!,
+  };
+  final item = childOf(x, 'item');
+  return ParsedPresence(
+    roomJid: from.substring(0, slash),
+    nick: from.substring(slash + 1),
+    unavailable: stanza.getAttribute('type') == 'unavailable',
+    statusCodes: codes,
+    affiliation: item?.getAttribute('affiliation') ?? '',
+    jid: item?.getAttribute('jid'),
+  );
+}
+
+/// Web isTrustedEventSender: `from` must be a BARE jid (a user or an occupant
+/// always carries a resource) on this session's own XMPP domain.
+bool isTrustedEventSender(String from, String ownDomain) {
+  final value = from.trim();
+  if (value.isEmpty || value.contains('/')) return false;
+  final at = value.indexOf('@');
+  if (at <= 0 || value.indexOf('@', at + 1) != -1) return false;
+  final domain = value.substring(at + 1).toLowerCase();
+  return ownDomain.isNotEmpty && domain == ownDomain.toLowerCase();
+}
+
+final RegExp _eventKeyShape = RegExp(r'^[A-Za-z0-9_-]+$');
+
+/// Web isSafeEventKey: `<appId>_<id>` shape that is safe as a URL segment.
+bool isSafeEventKey(String? value, {String appId = ''}) {
+  if (value == null || value.isEmpty || value.length > 128) return false;
+  if (!_eventKeyShape.hasMatch(value) || !value.contains('_')) return false;
+  if (appId.isNotEmpty && !value.startsWith('${appId}_')) return false;
+  return true;
 }
