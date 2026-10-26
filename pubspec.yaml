@@ -1,6 +1,6 @@
 name: ethora_sdk_flutter
 description: Ethora chat SDK for Flutter. Web config parity with Swift/Kotlin initialization behavior.
-version: 0.1.0
+version: 0.3.0
 homepage: https://github.com/dappros/ethora
 repository: https://github.com/dappros/ethora
 issue_tracker: https://github.com/dappros/ethora/issues
@@ -16,7 +16,23 @@ dependencies:
   web_socket_channel: ^3.0.3
   xml: ^6.5.0
   shared_preferences: ^2.5.3
+  flutter_secure_storage: ^9.2.4
   file_picker: ^10.3.2
+  url_launcher: ^6.3.3
+  # 2.12+ needs Dart 3.10 / Flutter 3.38; this pin keeps the SDK floor at Dart 3.6.
+  livekit_client: '>=2.11.0 <2.12.0'
+  # Direct dependency for 1:1 peer to peer calls. livekit_client 2.11.0 pins
+  # flutter_webrtc to exactly 1.6.0, so this must match it.
+  flutter_webrtc: 1.6.0
+  # Native incoming call UI (CallKit on iOS, full-screen notification on
+  # Android). 3.1.x needs Dart 3.0 / Flutter 3.10.
+  flutter_callkit_incoming: ^3.1.6
+  # In-app ringtone and ringback. 6.5/6.6 need Dart 3.6 / Flutter 3.27 (our
+  # floor); 6.7+ raise it.
+  audioplayers: '>=6.5.0 <6.7.0'
+  # Android mediaProjection foreground service, needed to share the screen
+  # in a call. 9.2.x needs Dart 3.4 / Flutter 3.22; 10+ needs Flutter 3.38.
+  flutter_foreground_task: '>=9.2.0 <9.3.0'
 
 dev_dependencies:
   flutter_test:
@@ -25,3 +41,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/calls/

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:ethora_sdk_flutter/ethora_sdk_flutter.dart';
+import 'package:ethora_sdk_flutter/src/networking/stanza_parser.dart';
 
 class InMemoryStore extends ChatComponentStore {
   ChatUser? user;
@@ -121,6 +122,9 @@ class FakeXmppClient extends XmppClient {
   final List<(String, bool)> typingCalls = <(String, bool)>[];
 
   @override
+  ChatConnectionState get state => ChatConnectionState.online;
+
+  @override
   Future<void> connect() async {
     onConnectionChanged?.call(ChatConnectionState.online);
   }
@@ -131,24 +135,116 @@ class FakeXmppClient extends XmppClient {
   }
 
   @override
-  Future<void> sendPresenceToRooms(List<String> roomJids) async {}
+  Future<void> sendPresenceToRooms(List<String> roomJids) async {
+    joinedRooms.addAll(roomJids);
+  }
 
   @override
   Future<void> sendRoomPresence(String roomJid) async {}
 
+  final List<String> sentTextIds = <String>[];
+  final List<String> joinedRooms = <String>[];
+
   @override
-  Future<void> requestHistory({
+  Future<MamPage> requestHistory({
     required String roomJid,
     int max = 30,
     String? beforeId,
-  }) async {}
+    String? afterId,
+    String? start,
+    String? end,
+    bool deliver = true,
+  }) async =>
+      const MamPage(complete: true);
 
   @override
   Future<void> sendText({
     required String roomJid,
     required String messageId,
     required String text,
+    bool isReply = false,
+    bool showInChannel = false,
+    String mainMessage = '',
+    String langSource = 'en',
+  }) async {
+    sentTextIds.add(messageId);
+    sentTexts.add(<String, Object?>{
+      'roomJid': roomJid,
+      'messageId': messageId,
+      'text': text,
+      'isReply': isReply,
+      'showInChannel': showInChannel,
+      'mainMessage': mainMessage,
+      'langSource': langSource,
+    });
+  }
+
+  final List<Map<String, Object?>> sentTexts = <Map<String, Object?>>[];
+  final List<(String, String, List<String>)> sentReactions =
+      <(String, String, List<String>)>[];
+  final List<(String, String, String)> sentEdits = <(String, String, String)>[];
+  final List<(String, String)> sentDeletes = <(String, String)>[];
+  final List<(String, String)> sentReceipts = <(String, String)>[];
+  final List<(String, String)> sentMarkers = <(String, String)>[];
+
+  @override
+  Future<void> sendReaction({
+    required String roomJid,
+    required String messageId,
+    required List<String> reactions,
+  }) async {
+    sentReactions.add((roomJid, messageId, reactions));
+  }
+
+  @override
+  Future<void> sendEdit({
+    required String roomJid,
+    required String messageId,
+    required String text,
+  }) async {
+    sentEdits.add((roomJid, messageId, text));
+  }
+
+  @override
+  Future<void> sendDelete({
+    required String roomJid,
+    required String messageId,
+  }) async {
+    sentDeletes.add((roomJid, messageId));
+  }
+
+  @override
+  void sendReceivedReceipt({
+    required String roomJid,
+    required String messageId,
+  }) {
+    sentReceipts.add((roomJid, messageId));
+  }
+
+  @override
+  void sendDisplayedMarker({
+    required String roomJid,
+    required String messageId,
+  }) {
+    sentMarkers.add((roomJid, messageId));
+  }
+
+  void emitReaction(ParsedReaction reaction) => onReaction?.call(reaction);
+  void emitReceipt(ParsedReceipt receipt) => onReceipt?.call(receipt);
+  void emitDisplayed(ParsedDisplayed marker) => onDisplayed?.call(marker);
+  void emitEdit(ParsedEdit edit) => onEdit?.call(edit);
+  void emitDelete(ParsedDelete delete) => onDelete?.call(delete);
+
+  @override
+  Future<Map<String, int>> getChatsPrivateStore() async => <String, int>{};
+
+  @override
+  Future<void> setTimestampToPrivateStore({
+    required String chatId,
+    required int timestamp,
   }) async {}
+
+  void reconnect() => onReconnected?.call();
 
   @override
   Future<void> sendTyping({

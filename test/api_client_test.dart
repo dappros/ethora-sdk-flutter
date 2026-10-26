@@ -15,7 +15,7 @@ void main() {
     });
 
     final api = ApiClient(
-      config: const ChatComponentConfig(baseUrl: 'https://api.ethoradev.com'),
+      config: const ChatComponentConfig(baseUrl: 'https://api.chat.ethora.com'),
       readAccessToken: () async => 'user-token',
       readRefreshToken: () async => null,
       writeTokens: (_, __) async {},
@@ -34,8 +34,12 @@ void main() {
     String token = 'stale-token';
 
     final client = MockClient((request) async {
-      if (request.url.path.endsWith('/users/login/refresh')) {
+      if (request.url.path == '/v1/users/login/refresh') {
         refreshCalls += 1;
+        // Web contract: the refresh token is the Authorization header and
+        // the body is empty (not the app token, not a refreshToken field).
+        expect(request.headers['Authorization'], 'refresh-token');
+        expect(request.body, '{}');
         return http.Response(
           jsonEncode(<String, dynamic>{
             'token': 'fresh-token',
@@ -53,7 +57,7 @@ void main() {
 
     final api = ApiClient(
       config: const ChatComponentConfig(
-        baseUrl: 'https://api.ethoradev.com',
+        baseUrl: 'https://api.chat.ethora.com',
         customAppToken: 'app-token',
       ),
       readAccessToken: () async => token,

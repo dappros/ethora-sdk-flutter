@@ -11,6 +11,10 @@ class ChatUser {
     this.xmppPassword,
     this.token,
     this.refreshToken,
+    this.photoUrl,
+    this.fileToken,
+    this.appLanguage,
+    this.chatLanguage,
   });
 
   final String? id;
@@ -24,6 +28,17 @@ class ChatUser {
   final String? xmppPassword;
   final String? token;
   final String? refreshToken;
+  final String? photoUrl;
+
+  /// Token appended as `ft` to secure media URLs (login/refresh response).
+  final String? fileToken;
+
+  /// Interface language of the account (BCP-47, e.g. "fr-CA"). Written by
+  /// `PUT /v1/users {appLanguage}`.
+  final String? appLanguage;
+
+  /// Language incoming messages are translated into (BCP-47).
+  final String? chatLanguage;
 
   String get displayName {
     final fromName = [
@@ -48,6 +63,10 @@ class ChatUser {
     String? xmppPassword,
     String? token,
     String? refreshToken,
+    String? photoUrl,
+    String? fileToken,
+    String? appLanguage,
+    String? chatLanguage,
   }) {
     return ChatUser(
       id: id ?? this.id,
@@ -61,6 +80,10 @@ class ChatUser {
       xmppPassword: xmppPassword ?? this.xmppPassword,
       token: token ?? this.token,
       refreshToken: refreshToken ?? this.refreshToken,
+      photoUrl: photoUrl ?? this.photoUrl,
+      fileToken: fileToken ?? this.fileToken,
+      appLanguage: appLanguage ?? this.appLanguage,
+      chatLanguage: chatLanguage ?? this.chatLanguage,
     );
   }
 
@@ -81,7 +104,27 @@ class ChatUser {
       xmppPassword: user['xmppPassword']?.toString(),
       token: json['token']?.toString(),
       refreshToken: json['refreshToken']?.toString(),
+      photoUrl: user['profileImage']?.toString(),
+      fileToken: json['fileToken']?.toString(),
+      appLanguage: _nonEmpty(user['appLanguage']),
+      chatLanguage: _nonEmpty(user['chatLanguage']),
     );
+  }
+
+  static String? _nonEmpty(Object? value) {
+    final text = value?.toString().trim();
+    return text == null || text.isEmpty ? null : text;
+  }
+
+  /// JSON without secrets (xmppPassword, token, refreshToken, fileToken).
+  /// Secrets are kept in secure storage by [ChatComponentStore].
+  Map<String, dynamic> toPublicJson() {
+    final json = toJson();
+    json.remove('xmppPassword');
+    json.remove('token');
+    json.remove('refreshToken');
+    json.remove('fileToken');
+    return json;
   }
 
   Map<String, dynamic> toJson() {
@@ -97,6 +140,10 @@ class ChatUser {
       'xmppPassword': xmppPassword,
       'token': token,
       'refreshToken': refreshToken,
+      'photoUrl': photoUrl,
+      'fileToken': fileToken,
+      'appLanguage': appLanguage,
+      'chatLanguage': chatLanguage,
     };
   }
 
@@ -113,6 +160,10 @@ class ChatUser {
       xmppPassword: json['xmppPassword']?.toString(),
       token: json['token']?.toString(),
       refreshToken: json['refreshToken']?.toString(),
+      photoUrl: json['photoUrl']?.toString(),
+      fileToken: json['fileToken']?.toString(),
+      appLanguage: _nonEmpty(json['appLanguage']),
+      chatLanguage: _nonEmpty(json['chatLanguage']),
     );
   }
 }
